@@ -1,0 +1,270 @@
+# =============================================================================
+# {{PROJECT_NAME}} — TESTING overlay
+# -----------------------------------------------------------------------------
+# A self-contained, disposable stack for automated test runs (local and CI).
+#
+#   make test          # or:
+#   docker compose --project-directory . \
+#     -f docker/compose/compose.yaml -f docker/compose/compose.test.yaml \
+#     run --rm test
+#
+# DESIGN GOALS, in priority order:
+#   1. Isolation — must never touch development data. Enforced by a distinct
+#      COMPOSE_PROJECT_NAME, which gives every volume, network, and container a
+#      different name, plus zero published ports.
+#   2. Speed — the database lives in tmpfs (RAM) and durability is traded away.
+#   3. Determinism — no bind-mounted dependency caches, no long-running state.
+#
+# THE RULE THIS STACK EXISTS FOR: tests write. `php artisan test` runs
+# `migrate:fresh`, and running it inside the DEVELOPMENT container wipes the
+# developer's own database. The reference project caught exactly that in an
+# audit — the gate script and the Makefile had two different definitions of
+# "run the tests", and the one CI called was the destructive one.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# NETWORK
+# -----------------------------------------------------------------------------
+# Stays internal. A test run must not be able to reach the host or the internet:
+# a test that silently calls a real payment sandbox is a test that will fail
+# mysteriously in CI and, worse, may succeed against production one day.
+networks:
+  backend:
+    internal: true
+
+# -----------------------------------------------------------------------------
+# VOLUMES
+# -----------------------------------------------------------------------------
+# mysql-data is redefined but never mounted (see the mysql service below, which
+# replaces it with tmpfs). It stays declared so the merge with the base file
+# remains valid.
+volumes:
+  mysql-data:
+    name: ${COMPOSE_PROJECT_NAME:-app-test}_mysql-data
+  # Composer's dev dependencies for the test run, kept out of the development
+  # stack's vendor volume so the two cannot contaminate each other.
+  test-vendor:
+    name: ${COMPOSE_PROJECT_NAME:-app-test}_test-vendor
+
+services:
+  # ===========================================================================
+  # DEPENDENCY PREPARATION — runs before the suite, and only it has egress
+  # ===========================================================================
+  # This service exists because the two goals above are in direct conflict on a
+  # cold volume: the stack is `internal: true` so nothing can reach the network,
+  # and the test runner was also asked to `composer install`, which must. On an
+  # empty test-vendor volume the run therefore died in Composer:
+  #
+  #     could not resolve host: github.com
+  #     error: cannot run ssh: No such file or directory
+  #
+  # Which means the isolated test stack — documented, recommended, and correct —
+  # had never actually been run from a cold volume until the gate script was
+  # routed through it.
+  #
+  # Splitting the two restores the intent instead of trading it away: fetching
+  # dependencies is a preparation step and is allowed egress; EXECUTING the
+  # suite is not, and stays on the internal network where a test that calls a
+  # payment sandbox still cannot succeed. The alternative — relaxing `internal`
+  # for the whole stack — would have bought the same convenience by deleting the
+  # guarantee the stack exists for.
+  #
+  # It is attached to `frontend` (a plain bridge) rather than `backend`: it needs
+  # the internet and has no business seeing the database at all.
+  test-deps:
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+      target: development
+      args:
+        PHP_VERSION: ${PHP_VERSION:-8.5.3}
+        APP_USER: ${APP_USER:-app}
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+    restart: "no"
+    networks: [frontend]
+    volumes:
+      - ./backend:/var/www/html:cached
+      - test-vendor:/var/www/html/vendor
+    environment:
+      APP_ENV: testing
+      XDEBUG_MODE: "off"
+      # Off deliberately: the install is this service's explicit command, not a
+      # side effect of its entrypoint. A failure must be attributable.
+      COMPOSER_AUTO_INSTALL: "false"
+    healthcheck:
+      disable: true
+    command: composer install --no-interaction --prefer-dist --no-progress
+
+  # ===========================================================================
+  # TEST RUNNER — the only service you interact with
+  # ===========================================================================
+  # Runs the suite and exits with the suite's exit code, which is what makes it
+  # usable as a CI gate. Uses `run --rm`, not `up`, so nothing lingers.
+  test:
+    build:
+      context: .
+      dockerfile: docker/php/Dockerfile
+      # The development target, because the test suite needs Composer's dev
+      # dependencies (PHPUnit, Mockery, Faker) and Xdebug for coverage —
+      # none of which exist in the production image.
+      target: development
+      args:
+        PHP_VERSION: ${PHP_VERSION:-8.5.3}
+        APP_USER: ${APP_USER:-app}
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+    # A test run is a one-shot job. Restarting it on failure would loop forever
+    # and hide the failure.
+    restart: "no"
+    networks: [backend]
+    volumes:
+      - ./backend:/var/www/html:cached
+      - test-vendor:/var/www/html/vendor
+    environment:
+      APP_ENV: testing
+      APP_DEBUG: "true"
+      # See the note in compose.yaml. A test that exercises an HTTP route needs
+      # this as much as a running server does.
+      APP_KEY: ${APP_KEY:?APP_KEY must be set — copy .env.example to .env}
+
+      # Points at the dedicated *_test schema created by the MySQL init script,
+      # so a `RefreshDatabase` truncation can never reach development data.
+      DB_CONNECTION: mysql
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_DATABASE: ${MYSQL_TEST_DATABASE:-app_test}
+      DB_USERNAME: ${MYSQL_USER:-app}
+      DB_PASSWORD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD must be set}
+
+      REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+      # A distinct Redis database index, so a test that flushes cache cannot
+      # evict development sessions even if both stacks somehow shared a server.
+      REDIS_DB: 1
+      REDIS_CACHE_DB: 2
+
+      # Cache stays on Redis — the engine that ships — and tests/TestCase.php
+      # flushes it before every test. Note that phpunit.xml's `<env>` for
+      # CACHE_STORE does NOT override this: PHPUnit never overwrites a variable
+      # already present in the environment.
+      CACHE_STORE: redis
+      SESSION_DRIVER: array
+      # `sync` executes jobs inline, in-process. Tests then assert on the
+      # RESULT of a job rather than racing a background worker — which is both
+      # deterministic and far easier to debug than a flaky async assertion.
+      QUEUE_CONNECTION: sync
+
+      # `array` swallows mail into an in-memory collection that Laravel's
+      # Mail::fake() assertions read. No Mailpit container is needed, which
+      # keeps the test stack smaller and faster.
+      MAIL_MAILER: array
+
+      # `coverage` is required for `--coverage`; override to `off` for a faster
+      # run when coverage is not being collected.
+      XDEBUG_MODE: ${XDEBUG_MODE:-off}
+
+      # OFF, and it must stay off: this service runs on the internal network and
+      # cannot reach a package registry, so an install attempted here can only
+      # fail — and it failed confusingly, deep inside Composer's VCS fallback,
+      # rather than saying the dependencies were not prepared. `test-deps` above
+      # installs them; scripts/quality.sh runs it first.
+      COMPOSER_AUTO_INSTALL: "false"
+
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+    healthcheck:
+      disable: true
+
+    command: php artisan test
+
+  # ===========================================================================
+  # Services disabled for testing
+  # ===========================================================================
+  # `replicas: 0` keeps the service defined (so the merge stays valid) while
+  # starting none of it. Nginx, the queue worker, and the scheduler are all
+  # irrelevant to a PHPUnit run: Laravel's test client invokes the HTTP kernel
+  # in-process without a web server, and QUEUE_CONNECTION=sync removes the need
+  # for a worker.
+  nginx:
+    deploy:
+      replicas: 0
+  php:
+    deploy:
+      replicas: 0
+  queue:
+    deploy:
+      replicas: 0
+  scheduler:
+    deploy:
+      replicas: 0
+
+  # ===========================================================================
+  # MYSQL — ephemeral, tuned for throughput over durability
+  # ===========================================================================
+  mysql:
+    # No published ports: the test database must be unreachable from the host.
+    ports: !reset []
+    # `!override` REPLACES the inherited list instead of merging into it.
+    # Without it Compose appends these entries to the base file's
+    # `mysql-data:/var/lib/mysql`, and the merged service then mounts both a
+    # named volume and a tmpfs at the same target — which Compose rejects.
+    volumes: !override
+      # No named volume — the data directory is tmpfs, so it lives in RAM and
+      # vanishes with the container. Every run therefore starts from a
+      # guaranteed-clean database, which eliminates the "passes locally, fails
+      # in CI" class of bug caused by leftover rows.
+      - ./docker/mysql/initdb:/docker-entrypoint-initdb.d:ro
+    tmpfs:
+      # Sized for a test dataset. Raise if the suite seeds heavily — an
+      # exhausted tmpfs surfaces as a confusing "table is full" error.
+      - /var/lib/mysql:size=1g,mode=1777
+    command:
+      # These override the committed my.cnf for this stack only. Every one
+      # trades durability for speed, which is the correct trade when the
+      # database is discarded at the end of the run:
+      #   flush_log_at_trx_commit=2 — do not fsync on every commit.
+      #   sync_binlog=0             — let the OS decide when to flush the binlog.
+      #   doublewrite=0             — skip InnoDB's torn-page protection; there
+      #                               is no crash to recover from.
+      #   skip-log-bin              — no replication, so the binlog is pure cost.
+      - --innodb-flush-log-at-trx-commit=2
+      - --sync-binlog=0
+      - --innodb-doublewrite=0
+      - --skip-log-bin
+      # Slow-query logging is noise in a test run.
+      - --slow-query-log=0
+      - --log-queries-not-using-indexes=0
+    # Faster than the base 60s: there is nothing to flush.
+    stop_grace_period: 10s
+
+  # ===========================================================================
+  # REDIS (PERSISTENT) — ephemeral during tests
+  # ===========================================================================
+  # Persistence is switched OFF here even though this is the "persistent"
+  # instance: a test run must start from an empty keyspace, and writing RDB
+  # snapshots would only slow it down. The instance still exists so that code
+  # paths using the queue/session connection behave exactly as in production.
+  redis:
+    ports: !reset []
+    # !override for the same reason as mysql above: drop the inherited
+    # redis-data volume so nothing survives the test run.
+    volumes: !override
+      - ./docker/redis/redis-persistent.conf:/usr/local/etc/redis/redis.conf:ro
+    command: >
+      redis-server /usr/local/etc/redis/redis.conf
+      --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+      --save ""
+      --appendonly no
+    stop_grace_period: 5s
+
+  # ===========================================================================
+  # REDIS (CACHE) — ephemeral
+  # ===========================================================================
+  redis-cache:
+    ports: !reset []
+    stop_grace_period: 5s

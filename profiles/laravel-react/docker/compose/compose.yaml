@@ -1,0 +1,482 @@
+# =============================================================================
+# {{PROJECT_NAME}} — BASE compose file
+# -----------------------------------------------------------------------------
+# Declares the service topology shared by every environment. This file is never
+# used alone; it is always merged with exactly one environment overlay:
+#
+#   development : compose.yaml + compose.dev.yaml
+#   testing     : compose.yaml + compose.test.yaml
+#   production  : compose.yaml + compose.prod.yaml
+#   CI          : compose.yaml + compose.dev.yaml + compose.ci.yaml
+#
+# The `Makefile` at the repository root wires this up. Raw equivalent:
+#   docker compose --project-directory . \
+#       -f docker/compose/compose.yaml -f docker/compose/compose.dev.yaml up -d
+#
+# PATH CONVENTION: every relative path here is resolved against the REPOSITORY
+# ROOT, not against this file's directory, because all invocations pass
+# `--project-directory .` from the root. This keeps build contexts identical to
+# what a CI runner would use.
+#
+# NOTE: there is no top-level `version:` key. It has been obsolete since Compose
+# V2 and current versions emit a warning when it is present.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# NETWORKS
+# -----------------------------------------------------------------------------
+# Two networks, not one. This is a security boundary, not organisation:
+#
+#   frontend — the edge. Only services that must be reachable from the host or
+#              from an ingress attach here.
+#   backend  — data plane. MySQL and Redis live ONLY here, so they have no route
+#              to or from the host network at all. Even if a port publish were
+#              added by mistake, an attacker who compromises Nginx still cannot
+#              reach the database without first pivoting through PHP.
+#
+# `internal: true` on the backend network is what enforces it: Docker creates no
+# gateway to the outside world for that bridge.
+networks:
+  frontend:
+    name: ${COMPOSE_PROJECT_NAME:-app}_frontend
+    driver: bridge
+
+  backend:
+    name: ${COMPOSE_PROJECT_NAME:-app}_backend
+    driver: bridge
+    # Overridden to `false` in compose.dev.yaml so a developer can attach a GUI
+    # client (TablePlus, DBeaver) to MySQL from the host. In test and production
+    # it stays true.
+    internal: true
+
+# -----------------------------------------------------------------------------
+# VOLUMES
+# -----------------------------------------------------------------------------
+# Named volumes, not host bind mounts, for all persistent data. On Docker Desktop
+# for Windows a bind-mounted MySQL data directory goes through the 9p/virtiofs
+# translation layer, which is both dramatically slower and prone to file-locking
+# errors that corrupt InnoDB. Named volumes live in the Linux VM's native
+# filesystem and avoid the whole class of problem.
+volumes:
+  mysql-data:
+    name: ${COMPOSE_PROJECT_NAME:-app}_mysql-data
+
+  # Only the persistent Redis gets a volume. The cache instance intentionally
+  # has none: its data is derived and must not survive a restart.
+  redis-data:
+    name: ${COMPOSE_PROJECT_NAME:-app}_redis-data
+
+  mailpit-data:
+    name: ${COMPOSE_PROJECT_NAME:-app}_mailpit-data
+
+  # Dependency directories are named volumes rather than bind-mounted host
+  # directories. Two reasons:
+  #   1. Speed — thousands of small files perform terribly across the Windows
+  #      filesystem bridge; `npm ci` can take minutes instead of seconds.
+  #   2. Correctness — native modules and PHP extensions compile against the
+  #      container's libc. Sharing them with a Windows host produces binaries
+  #      that work in neither place.
+  backend-vendor:
+    name: ${COMPOSE_PROJECT_NAME:-app}_backend-vendor
+
+  frontend-node-modules:
+    name: ${COMPOSE_PROJECT_NAME:-app}_frontend-node-modules
+
+# -----------------------------------------------------------------------------
+# NOTE — WHY MYSQL'S CONFIG IS BAKED INTO AN IMAGE
+# -----------------------------------------------------------------------------
+# MySQL's option file is delivered inside a purpose-built image, NOT as a bind
+# mount and NOT as a Compose `config`.
+#
+# WHY THIS MATTERS (verified, not theoretical): a file bind-mounted from a
+# Windows drive is presented inside the container as world-writable (0777).
+# MySQL treats a world-writable option file as a tampering risk and SILENTLY
+# IGNORES it, logging only:
+#     "World-writable config file '/etc/mysql/conf.d/server.cnf' is ignored"
+#
+# The server then starts happily on its built-in defaults. The observable
+# symptom is subtle and severe for an Arabic-first platform: the database is
+# created with utf8mb4_0900_ai_ci, an accent-insensitive collation under which
+# Arabic names differing only by a hamza or a diacritic compare as EQUAL — so a
+# UNIQUE index on person names would reject legitimate distinct records.
+#
+# The fix is to bake the file into a thin image layer with an explicit 0444
+# mode — see docker/mysql/Dockerfile, which documents the failure and the
+# alternatives that were tried and rejected (including Compose `configs:`,
+# whose `mode` is ignored outside Swarm).
+
+# -----------------------------------------------------------------------------
+# REUSABLE FRAGMENTS
+# -----------------------------------------------------------------------------
+# YAML anchors. Compose ignores top-level keys starting with `x-`, so these are
+# purely a way to define something once and merge it into several services.
+x-logging: &default-logging
+  # Cap container logs. Without this, Docker's json-file driver grows without
+  # bound and eventually fills the host disk — a genuinely common way to take a
+  # development machine down.
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# Shared by the three services that run the same PHP image (fpm, queue worker,
+# scheduler). They differ only in the command they execute.
+x-php-common: &php-common
+  build:
+    context: .
+    dockerfile: docker/php/Dockerfile
+    args:
+      PHP_VERSION: ${PHP_VERSION:-8.5.3}
+      APP_USER: ${APP_USER:-app}
+      # Matching the host uid keeps bind-mounted files editable from the host.
+      APP_UID: ${APP_UID:-1000}
+      APP_GID: ${APP_GID:-1000}
+  restart: unless-stopped
+  logging: *default-logging
+  networks: [backend]
+
+# The application environment every PHP-based service needs. Declared once so
+# the web server, the queue worker and the scheduler cannot drift apart: the
+# reference project once named the mailer on `php` alone, and the worker — the
+# process that actually sends mail — silently fell back to the `log` driver.
+x-php-env: &php-env
+  APP_ENV: ${APP_ENV:-local}
+  # Mandatory, exactly like MYSQL_PASSWORD below, and for the same reason:
+  # without it the application does not run in a degraded way, it throws on
+  # the first request that touches a session, cookie, or encrypted column.
+  #
+  # The reference project passed it only in production, so development and
+  # test relied on a hand-made backend/.env that is gitignored and that nothing
+  # creates — which is why the suite passed on a warm machine and the first
+  # clean-checkout CI run failed inside `GET /` after four gates had gone green.
+  APP_KEY: ${APP_KEY:?APP_KEY must be set — copy .env.example to .env}
+  APP_DEBUG: ${APP_DEBUG:-true}
+  APP_URL: ${APP_URL:-http://localhost:8080}
+  FRONTEND_URL: ${FRONTEND_URL:-}
+
+  # --- Database ----------------------------------------------------------
+  # Hostnames are Compose service names, resolved by Docker's embedded DNS.
+  DB_CONNECTION: mysql
+  DB_HOST: ${DB_HOST:-mysql}
+  DB_PORT: ${DB_PORT:-3306}
+  DB_DATABASE: ${MYSQL_DATABASE:-app}
+  DB_USERNAME: ${MYSQL_USER:-app}
+  DB_PASSWORD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD must be set — copy .env.example to .env}
+
+  # --- Redis (two instances) ---------------------------------------------
+  # `redis` holds queue jobs and sessions (noeviction, persisted).
+  # `redis-cache` holds cache and rate limits (allkeys-lru, ephemeral).
+  #
+  # Laravel's config/database.php must define a `cache` Redis connection
+  # pointing at REDIS_CACHE_HOST; the default connection stays on
+  # REDIS_HOST. See docker/README.md for the exact snippet.
+  REDIS_HOST: ${REDIS_HOST:-redis}
+  REDIS_PORT: ${REDIS_PORT:-6379}
+  REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set — copy .env.example to .env}
+  REDIS_CACHE_HOST: ${REDIS_CACHE_HOST:-redis-cache}
+  REDIS_CACHE_PORT: ${REDIS_CACHE_PORT:-6379}
+  REDIS_CACHE_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+
+  # Approved architecture: Redis backs cache, sessions, and the queue.
+  CACHE_STORE: redis
+  SESSION_DRIVER: redis
+  QUEUE_CONNECTION: redis
+
+  # --- Mail --------------------------------------------------------------
+  MAIL_MAILER: smtp
+  MAIL_HOST: ${MAIL_HOST:-mailpit}
+  MAIL_PORT: ${MAIL_PORT:-1025}
+
+services:
+  # ===========================================================================
+  # NGINX — HTTP edge for the Laravel API
+  # ===========================================================================
+  nginx:
+    build:
+      context: .
+      dockerfile: docker/nginx/Dockerfile
+      args:
+        NGINX_VERSION: ${NGINX_VERSION:-1.29}
+    restart: unless-stopped
+    logging: *default-logging
+
+    # Attached to BOTH networks: it is the only service permitted to bridge the
+    # edge and the data plane, and it reaches PHP over the backend network.
+    networks: [frontend, backend]
+
+    depends_on:
+      php:
+        # `service_started` would let Nginx accept traffic before FPM can answer,
+        # producing 502s on every request during startup. `service_healthy`
+        # waits for the FastCGI ping to succeed.
+        condition: service_healthy
+
+    # Writable scratch space for Nginx's temp paths. Declaring them as tmpfs is
+    # what allows `read_only: true` on the root filesystem in production.
+    tmpfs:
+      - /tmp:mode=1777,size=64m
+      - /var/run:mode=0755,size=8m
+      - /var/cache/nginx:mode=0755,size=64m
+
+  # ===========================================================================
+  # PHP-FPM — Laravel application server
+  # ===========================================================================
+  php:
+    <<: *php-common
+    environment:
+      <<: *php-env
+
+      # --- FPM pool sizing (consumed by docker/php/fpm/www.conf) -----------
+      PHP_FPM_PM: ${PHP_FPM_PM:-dynamic}
+      PHP_FPM_MAX_CHILDREN: ${PHP_FPM_MAX_CHILDREN:-20}
+      PHP_FPM_START_SERVERS: ${PHP_FPM_START_SERVERS:-4}
+      PHP_FPM_MIN_SPARE: ${PHP_FPM_MIN_SPARE:-2}
+      PHP_FPM_MAX_SPARE: ${PHP_FPM_MAX_SPARE:-6}
+
+    depends_on:
+      mysql:
+        # Laravel reads config at boot and connects lazily, but a queue worker
+        # started before MySQL is accepting connections dies immediately and
+        # burns restart attempts. Gate on health instead.
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+
+  # ===========================================================================
+  # QUEUE WORKER — queue:work
+  # ===========================================================================
+  # A SEPARATE container from php-fpm, not a background process inside it.
+  # Reasons:
+  #   - Independent scaling: a burst of background work needs more workers,
+  #     not more web capacity.
+  #   - Independent failure: a poisoned job restarts only this container.
+  #   - Correct signals: `docker stop` sends SIGTERM, which Laravel's worker
+  #     handles by finishing the current job before exiting. A worker running as
+  #     a child of FPM would be killed mid-job.
+  queue:
+    <<: *php-common
+    # `--max-time=3600` recycles the worker hourly. Long-lived PHP processes
+    # accumulate memory and hold stale container bindings; recycling is the
+    # standard mitigation. `--tries=3` bounds retry attempts so a permanently
+    # failing job lands in failed_jobs instead of looping forever.
+    command: >
+      php artisan queue:work
+      --queue=high,default,low
+      --tries=3
+      --max-time=3600
+      --sleep=3
+    environment:
+      <<: *php-env
+    # Give an in-flight job time to finish before SIGKILL. The default is 10s,
+    # which is not enough for a job that is calling an external provider.
+    stop_grace_period: 60s
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+    # The image's HEALTHCHECK pings the FPM master over FastCGI. No FPM master
+    # runs here, so that inherited check can never pass — but `disable: true`
+    # trades a false negative for NO readiness state at all, and
+    # `docker compose up --wait` refuses to wait on a service it cannot judge:
+    #
+    #     container app-scheduler-1 has no healthcheck configured
+    #     Process completed with exit code 1
+    #
+    # That was the whole of the reference project's first CI run: nine
+    # containers came up, seven reported healthy, and the build failed on the
+    # two that could not answer the question. It stayed invisible locally
+    # because the development stack had been running for days without a cold
+    # `up --wait`.
+    #
+    # Process presence is weaker evidence than a served request, and saying so
+    # is the point: a wedged worker still has a live process. It is nonetheless
+    # decisively stronger than nothing, because it catches the two failure modes
+    # that actually occur here — a crash loop, and the entrypoint's idle guard —
+    # both of which leave the container `up` and doing no work at all.
+    #
+    # The bracket in `[q]ueue:work` is load-bearing, not a typo. `CMD-SHELL`
+    # runs the probe as `sh -c "pgrep -f ..."`, and that shell's own command
+    # line contains the pattern — so a plain `pgrep -f 'queue:work'` matches
+    # itself and reports healthy for a container whose worker is dead. Written
+    # as a character class it still matches the worker's `queue:work`, while the
+    # probe's own literal `[q]ueue:work` does not match the expression.
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f '[q]ueue:work' >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      # Long, because in development the vendor directory is installed by the
+      # php service's entrypoint while this container is already starting.
+      start_period: 120s
+      retries: 5
+
+  # ===========================================================================
+  # SCHEDULER — Laravel task scheduling
+  # ===========================================================================
+  # `schedule:work` is a long-running foreground process that invokes the
+  # scheduler every minute. It replaces a host crontab, which does not exist
+  # inside a container.
+  #
+  # IMPORTANT: exactly ONE replica. Running two means every scheduled task fires
+  # twice — a fee charged twice, a notification sent twice, a deadline closed
+  # twice. Enforced by `deploy.replicas: 1` in compose.prod.yaml.
+  scheduler:
+    <<: *php-common
+    command: php artisan schedule:work
+    environment:
+      <<: *php-env
+    stop_grace_period: 30s
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+    # Same reasoning as the queue worker above — `schedule:work` serves no port
+    # either, and this is the service whose missing readiness state failed the
+    # reference project's first CI run by name.
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f '[s]chedule:work' >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      start_period: 120s
+      retries: 5
+
+  # ===========================================================================
+  # MYSQL 8.4 LTS
+  # ===========================================================================
+  mysql:
+    # Built rather than used directly, solely so the server option file lands
+    # with a mode MySQL will accept. See docker/mysql/Dockerfile.
+    build:
+      context: .
+      dockerfile: docker/mysql/Dockerfile
+      args:
+        MYSQL_VERSION: ${MYSQL_VERSION:-8.4.7}
+    image: ${COMPOSE_PROJECT_NAME:-app}/mysql:${MYSQL_VERSION:-8.4.7}
+    restart: unless-stopped
+    logging: *default-logging
+
+    # Data plane only — deliberately NOT on the frontend network.
+    networks: [backend]
+
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD must be set}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-app}
+      MYSQL_USER: ${MYSQL_USER:-app}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD must be set}
+      # Consumed by docker/mysql/initdb/01-init-databases.sh.
+      MYSQL_TEST_DATABASE: ${MYSQL_TEST_DATABASE:-app_test}
+      TZ: ${TZ:-UTC}
+
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # `:ro` — the container must never be able to rewrite its own
+      # initialisation scripts. (The server config is baked into the image
+      # instead; see the note above for why.)
+      - ./docker/mysql/initdb:/docker-entrypoint-initdb.d:ro
+
+    # WHY mysqladmin ping and not `mysql -e 'SELECT 1'`:
+    #   ping returns success as soon as the server accepts connections, which is
+    #   exactly the readiness condition dependents care about. A SELECT also
+    #   requires auth to be fully initialised and produces noisy failures during
+    #   the first-boot window while initdb scripts run.
+    #
+    # start_period is generous: first boot must initialise the data directory,
+    # build the system tables, and run the init scripts. Failures during
+    # start_period do not count toward `retries`, so a slow first boot cannot
+    # mark the container unhealthy.
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+    # InnoDB must flush its buffer pool and finish open transactions. Killing it
+    # early forces crash recovery on next boot and risks corruption.
+    stop_grace_period: 60s
+
+    # MySQL uses far more than Docker's default 64MB of shared memory for
+    # internal temp tables; the default causes hard-to-diagnose failures on
+    # larger sorts and joins.
+    shm_size: 256mb
+
+  # ===========================================================================
+  # REDIS (PERSISTENT) — Queue + Sessions
+  # ===========================================================================
+  # Holds data whose loss is a bug: queued jobs (payments, deadline closes,
+  # notifications) and user sessions. Policy: noeviction + RDB persistence.
+  # See docker/redis/redis-persistent.conf.
+  redis:
+    image: redis:${REDIS_VERSION:-8.2-alpine}
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [backend]
+
+    # The config file is passed as the first argument, then the password is
+    # appended as a flag. The password is NOT written into the .conf file
+    # because that file is committed to version control and a secret must never
+    # be.
+    command: >
+      redis-server /usr/local/etc/redis/redis.conf
+      --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+
+    volumes:
+      - redis-data:/data
+      - ./docker/redis/redis-persistent.conf:/usr/local/etc/redis/redis.conf:ro
+
+    # The password is supplied via REDISCLI_AUTH (an env var redis-cli reads)
+    # rather than `-a`, which would print a warning to stderr on every check and
+    # expose the password in the container's process list.
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+      TZ: ${TZ:-UTC}
+
+    # Allow a final RDB snapshot to complete so queued jobs survive shutdown.
+    stop_grace_period: 30s
+
+  # ===========================================================================
+  # REDIS (CACHE) — application cache + rate limiting
+  # ===========================================================================
+  # Holds only derived data. Policy: allkeys-lru with NO persistence, which is
+  # safe precisely because this instance is physically separate from the queue.
+  # Eviction here costs a cache miss; on a shared instance the same policy
+  # could silently drop a queued payment job.
+  redis-cache:
+    image: redis:${REDIS_VERSION:-8.2-alpine}
+    restart: unless-stopped
+    logging: *default-logging
+    networks: [backend]
+
+    command: >
+      redis-server /usr/local/etc/redis/redis.conf
+      --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+
+    volumes:
+      # No data volume, deliberately — see the volumes block above.
+      - ./docker/redis/redis-cache.conf:/usr/local/etc/redis/redis.conf:ro
+
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
+      TZ: ${TZ:-UTC}
+
+    # Nothing to flush — a cache may be killed abruptly with no consequence.
+    stop_grace_period: 5s

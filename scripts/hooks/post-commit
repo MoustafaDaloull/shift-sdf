@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# =============================================================================
+# post-commit — تذكير المزامنة (الالتزام والدفع حركة واحدة)
+# -----------------------------------------------------------------------------
+# يُثبَّت بـ: make hooks   (أو نسخه إلى .git/hooks/post-commit مع chmod +x)
+#
+# القاعدة تجعل الالتزام والدفع حركة واحدة. وهذا الخطّاف **يذكّر ولا يدفع**:
+#   · الدفع التلقائي يقع بلا قرارك، وقد يذهب إلى فرع لست فيه.
+#   · وهو يسقط بانقطاع الشبكة، فيصير خطّافٌ يُعطِّل الالتزام لسبب خارج الكود.
+#
+# الفرض الحقيقي في `QG-SYNC` داخل scripts/quality.sh — تلك تُفشِل، وهذه تُنبِّه
+# في الثانية التي يُولد فيها الانحراف بدل أن تُكتشف بعد ساعة.
+#
+# post-commit لا يستطيع إلغاء الالتزام أصلًا: رمز خروجه مُهمَل بحكم Git. فهو
+# إخبارٌ محض بحكم موضعه، لا اختيارًا في التصميم.
+# =============================================================================
+
+set -uo pipefail
+
+BRANCH="$(git branch --show-current 2>/dev/null || true)"
+[ -z "$BRANCH" ] && exit 0
+
+yellow() { printf '\033[33m%s\033[0m\n' "$1"; }
+dim()    { printf '\033[2m%s\033[0m\n' "$1"; }
+
+if ! UPSTREAM="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null)"; then
+    echo
+    yellow "⚠  QG-SYNC — '$BRANCH' بلا upstream · لم يُدفع قط"
+    dim "   git push -u origin $BRANCH"
+    exit 0
+fi
+
+AHEAD="$(git rev-list --count "$UPSTREAM"..HEAD 2>/dev/null || echo 0)"
+
+if [ "$AHEAD" -gt 0 ]; then
+    echo
+    yellow "⚠  QG-SYNC — $AHEAD التزام غير مدفوع · الالتزام والدفع حركة واحدة"
+    dim "   git push origin $BRANCH"
+    dim "   وQG-SYNC ستُفشل التشغيلة حتى يُدفع."
+fi
+
+exit 0

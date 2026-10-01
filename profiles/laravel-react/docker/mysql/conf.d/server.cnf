@@ -1,0 +1,167 @@
+# =============================================================================
+# {{PROJECT_NAME}} — MySQL 8.4 LTS server configuration
+# -----------------------------------------------------------------------------
+# Baked into /etc/mysql/conf.d/ (see docker/mysql/Dockerfile for why it is not a
+# bind mount), which the official image reads last, so these values override
+# the image defaults.
+#
+# MySQL 8.4 LTS is the approved primary datastore. 8.4 is chosen over 9.x
+# because LTS releases receive bug-fix support for eight years and are what
+# managed database services offer as a stable major version.
+# =============================================================================
+
+[mysqld]
+
+# -----------------------------------------------------------------------------
+# Character set and collation — Arabic correctness
+# -----------------------------------------------------------------------------
+# utf8mb4 is the ONLY correct choice: MySQL's legacy `utf8` is a 3-byte subset
+# that cannot store 4-byte code points, which silently truncates emoji and some
+# extended Arabic presentation forms on insert.
+character-set-server = utf8mb4
+
+# utf8mb4_unicode_ci implements the full Unicode Collation Algorithm, so Arabic
+# strings sort and compare correctly. The server default (utf8mb4_0900_ai_ci) is
+# faster but its accent-insensitivity treats Arabic diacritics (harakat) as
+# equal to their bare letters — meaning names that differ only by a hamza would
+# collide in a UNIQUE index. That is unacceptable for person names.
+collation-server = utf8mb4_unicode_ci
+
+# -----------------------------------------------------------------------------
+# Time
+# -----------------------------------------------------------------------------
+# UTC in the database, always. Timezone conversion is a presentation concern and
+# belongs in the application layer. Storing local time makes deadlines
+# ambiguous and breaks any future multi-region deployment.
+default-time-zone = '+00:00'
+
+# -----------------------------------------------------------------------------
+# SQL correctness
+# -----------------------------------------------------------------------------
+# STRICT_TRANS_TABLES  : reject out-of-range or truncating writes instead of
+#                        silently coercing them. A too-long name must error, not
+#                        be quietly cut off.
+# NO_ZERO_DATE/IN_DATE : '0000-00-00' is not a date; forbid it outright.
+# ERROR_FOR_DIVISION_BY_ZERO : error rather than returning NULL.
+# NO_ENGINE_SUBSTITUTION : fail if a requested storage engine is unavailable,
+#                        rather than silently creating the table with another.
+# ONLY_FULL_GROUP_BY   : reject ambiguous GROUP BY queries. Painful during
+#                        development, but it catches genuinely wrong aggregate
+#                        results — which on a money-handling platform means
+#                        wrong financial reporting figures.
+sql_mode = "STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION,ONLY_FULL_GROUP_BY"
+
+# -----------------------------------------------------------------------------
+# Storage engine
+# -----------------------------------------------------------------------------
+default-storage-engine = InnoDB
+
+# Development sizing. InnoDB caches data and indexes here; on a laptop, 256M is
+# a reasonable share of RAM. A managed service sizes this automatically in
+# production (roughly 75% of instance memory) — do NOT copy this value there.
+innodb_buffer_pool_size = 256M
+
+# flush_log_at_trx_commit:
+#   1 = flush to disk on every commit (fully ACID, survives OS crash) — required
+#       in production for payment data.
+#   2 = flush to OS cache, sync once per second. Survives a process crash but
+#       not a host crash, and is dramatically faster for test suites that run
+#       thousands of transactions.
+# 1 is kept here because the development database should behave like production.
+# compose.test.yaml overrides it to 2 for the throwaway test database.
+innodb_flush_log_at_trx_commit = 1
+
+# One file per table: makes it possible to reclaim disk after dropping a table
+# and to move individual tables between instances.
+innodb_file_per_table = 1
+
+# -----------------------------------------------------------------------------
+# Connections
+# -----------------------------------------------------------------------------
+# Must exceed the total possible PHP-FPM workers across the app, queue, and
+# scheduler containers, plus headroom for admin tooling. Each Laravel request
+# holds one connection for the life of the request.
+max_connections = 200
+
+# Drop idle connections after 5 minutes. Laravel's queue workers are long-lived
+# and can hold a connection open across a quiet period; without a timeout, dead
+# connections accumulate against max_connections.
+wait_timeout = 300
+interactive_timeout = 300
+
+# Large enough for a bulk import or a media-metadata blob. The 8.4 default (64M)
+# is usually fine; raised for headroom on migrations that rewrite large tables.
+max_allowed_packet = 128M
+
+# -----------------------------------------------------------------------------
+# Observability
+# -----------------------------------------------------------------------------
+# Log queries slower than 1s AND queries that scan a whole table without an
+# index. The second is the more valuable of the two: it catches a query that is
+# fast on 100 development rows and catastrophic on 100,000 production rows.
+slow_query_log = 1
+long_query_time = 1
+log_queries_not_using_indexes = 1
+# Cap the not-using-indexes logging so a single bad endpoint cannot fill the
+# disk with identical entries.
+log_throttle_queries_not_using_indexes = 10
+slow_query_log_file = /var/log/mysql/slow.log
+
+# General query log stays OFF: it records every statement including those
+# containing personal data and password hashes, and it is a severe performance
+# drag. Enable it manually and briefly when debugging, never by default.
+general_log = 0
+
+# Error log: deliberately NOT set.
+#
+# `log_error = /dev/stderr` looks right but breaks the server: MySQL appends
+# `.err` to the configured value, so it tries to open `/dev/stderr.err`, fails
+# with "Permission denied", declares the data directory unusable, and aborts
+# during initialisation.
+#
+# Omitting the setting is correct here — the official image already directs the
+# error log to the console, so `docker compose logs mysql` shows everything and
+# the log collector captures it in production.
+
+# -----------------------------------------------------------------------------
+# Security
+# -----------------------------------------------------------------------------
+# Disallow LOAD DATA LOCAL INFILE. When enabled, a compromised or malicious
+# MySQL server can instruct the client to read arbitrary files from the
+# application container and send them back.
+local_infile = 0
+
+# Restrict server-side file import/export to a directory that does not exist,
+# effectively disabling SELECT ... INTO OUTFILE as a data-exfiltration path.
+secure_file_priv = /var/lib/mysql-files
+
+# -----------------------------------------------------------------------------
+# Trigger creation by the application user
+# -----------------------------------------------------------------------------
+# Binary logging is on, and MySQL then refuses CREATE TRIGGER from any account
+# without SUPER (ERROR 1419). The application user deliberately does not have
+# SUPER, and granting it would be far worse than what this flag permits.
+#
+# A platform needs triggers for exactly one class of reason: an append-only
+# table (an audit log) whose guarantee is enforced at two levels — absent
+# update/delete methods in the application, and BEFORE UPDATE/DELETE triggers
+# here. The application level alone is not enough: an audit log that any
+# database credential can rewrite is not an audit log. The trigger is what
+# makes the guarantee real rather than conventional.
+#
+# What this flag actually relaxes: MySQL stops requiring SUPER for creating
+# triggers and stored functions, trusting creators not to write
+# replication-unsafe non-deterministic routines. Such triggers only raise
+# SIGNAL — they are deterministic, write nothing, and are replication-safe.
+#
+# Production note: managed MySQL services restrict SUPER the same way, so this
+# is not a local-only workaround. `log_bin_trust_function_creators` must be set
+# as a database flag on the managed instance or the audit-log migration will
+# fail on deploy exactly as it failed locally before this line.
+log_bin_trust_function_creators = ON
+
+[client]
+default-character-set = utf8mb4
+
+[mysql]
+default-character-set = utf8mb4

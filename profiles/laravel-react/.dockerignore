@@ -1,0 +1,143 @@
+# =============================================================================
+# {{PROJECT_NAME}} — Docker build context exclusions
+# -----------------------------------------------------------------------------
+# Every build in this project uses the REPOSITORY ROOT as its context, so that a
+# single Dockerfile can copy from backend/, frontend/, and docker/ together.
+# That makes this file load-bearing rather than cosmetic:
+#
+#   1. SPEED — the context is uploaded to the Docker daemon before the build
+#      starts. A documentation-heavy repository would otherwise ship hundreds
+#      of megabytes of source documents and prototype bundles to the daemon
+#      on every build.
+#
+#   2. SECURITY — anything in the context can be captured by a `COPY . .`, and
+#      an excluded file cannot leak into an image layer even by mistake. A .env
+#      or a service-account key baked into a layer stays in the image history
+#      forever, and pushing that image to a registry publishes it.
+#
+#   3. CACHE — the daemon hashes the context. A file that changes constantly
+#      (a log, a local .env) invalidates the build cache on every single build
+#      even when no source changed.
+#
+# The strategy below is deny-broadly, then re-allow. It is safer than listing
+# exclusions one by one, because a file added later is excluded by default
+# instead of silently entering the context.
+#
+# TRAP (also in frontend/.gitignore): the `credentials*` pattern below matches a
+# source file named `Credentials*.tsx` — Docker patterns are case-sensitive on
+# Linux but the same spelling in .gitignore on Windows is not. Name components
+# so they never start with a word in section 1.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 1. SECRETS — never in a build context, under any circumstance
+# -----------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cert
+credentials*
+service-account*
+secrets*
+gha-creds-*.json
+
+# -----------------------------------------------------------------------------
+# 2. VERSION CONTROL AND TOOLING
+# -----------------------------------------------------------------------------
+# .git is frequently the largest single directory in a repository and contains
+# every historical version of every file — including secrets deleted long ago.
+.git
+.gitignore
+.gitattributes
+.github/
+.claude/
+
+# -----------------------------------------------------------------------------
+# 3. DEPENDENCIES — always reinstalled inside the image
+# -----------------------------------------------------------------------------
+# Host-installed dependencies are compiled against the host's libc and are
+# useless (often actively broken) inside the container. `composer install` and
+# `npm ci` run in the build, so copying these in would only slow the build and
+# risk shipping a stale tree.
+**/node_modules/
+**/vendor/
+**/.pnpm-store/
+
+# -----------------------------------------------------------------------------
+# 4. BUILD OUTPUT
+# -----------------------------------------------------------------------------
+**/dist/
+**/build/
+**/.vite/
+**/coverage/
+**/*.tsbuildinfo
+
+# -----------------------------------------------------------------------------
+# 5. LARAVEL RUNTIME STATE
+# -----------------------------------------------------------------------------
+# Compiled views, framework caches, and logs are generated per-container. A
+# cached config baked into an image is a genuine production hazard: it would
+# pin the image to the build machine's environment values, so the deployed app
+# would silently use the wrong database host.
+backend/storage/framework/cache/**
+backend/storage/framework/sessions/**
+backend/storage/framework/views/**
+backend/storage/logs/**
+backend/bootstrap/cache/*.php
+backend/.phpunit.result.cache
+backend/.phpunit.cache/
+backend/.deptrac.cache
+
+# -----------------------------------------------------------------------------
+# 6. DOCUMENTATION AND SOURCE MATERIAL
+# -----------------------------------------------------------------------------
+# None of it belongs in a runtime image, and together it dominates the context
+# size. Re-allow a specific documentation input only when a seeder reads it
+# from inside the image, and say so beside the rule.
+docs/
+*.md
+!docker/**/*.md
+*.docx
+*.pdf
+*.zip
+
+# -----------------------------------------------------------------------------
+# 7. EDITOR, OS, AND LOCAL ARTEFACTS
+# -----------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+~$*
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# -----------------------------------------------------------------------------
+# 8. LOGS, DUMPS, AND LOCAL DATABASES
+# -----------------------------------------------------------------------------
+*.log
+*.sql
+*.dump
+*.sqlite
+*.db
+# Re-allowed: initialisation scripts are source, not data. They are mounted at
+# runtime rather than copied into an image, but keeping them in the context
+# means a future Dockerfile can bake them in without another change here.
+!docker/mysql/initdb/*.sql
+
+# -----------------------------------------------------------------------------
+# 9. COMPOSE FILES
+# -----------------------------------------------------------------------------
+# Compose orchestrates the containers; it is never needed INSIDE one. Excluding
+# it also avoids the recursive oddity of an image containing its own recipe.
+docker/compose/
+compose.override.yaml
+compose.override.yml
+Makefile

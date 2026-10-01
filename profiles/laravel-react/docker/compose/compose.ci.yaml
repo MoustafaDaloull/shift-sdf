@@ -1,0 +1,75 @@
+# =============================================================================
+# CI overlay - build layer cache and nothing else
+# -----------------------------------------------------------------------------
+# This layer is never used locally and changes no service. All it adds is a
+# source and a destination for the BuildKit cache, because `type=gha` only
+# works inside a GitHub runner.
+#
+# -- Why it exists ----------------------------------------------------------
+# A measured CI run in the reference project, broken down by step:
+#
+#     build and start the stack ..... 4:12   <- 73% of the whole run
+#     install PHP dependencies ...... 0:02
+#     prepare the database .......... 0:22
+#     every gate and the tests ...... 0:53
+#     ------------------------------------
+#     total ......................... 5:45
+#
+# The checking itself is one minute; the rest is a from-scratch rebuild on
+# every commit - `apk add`, `install-php-extensions` (which compiles them),
+# xdebug - all layers that only change when the Dockerfile does. A GitHub
+# runner starts cold, so the project paid those four minutes every time.
+#
+# -- Why a separate layer instead of editing compose.yaml -------------------
+# `type=gha` outside a GitHub runner means a failing cache export on a
+# developer machine. The rule is that one file serving two environments ends
+# in a silent divergence between them - the same reason compose.test.yaml is
+# separate.
+#
+# -- Degrading is enforced, not assumed -------------------------------------
+# "a cache failure degrades rather than breaks" was a wrong assumption in this
+# file's first version, and the next run disproved it: the cache service
+# answered the export with a 400 and took the whole build down with it. Cache
+# export is fatal by default in BuildKit.
+#
+# So every `cache_to` here carries `ignore-error=true`, which turns degrading
+# into enforced behaviour rather than a promise. That is the framework's own
+# rule applied to itself: nothing counts as working until it has been tested
+# by failing.
+#
+# -- Scopes -----------------------------------------------------------------
+# php, queue and scheduler share one Dockerfile and one `development` target,
+# so they share a single cache scope and the second build hits the first
+# build's layers. nginx, node and mysql each have their own file and scope.
+# =============================================================================
+
+services:
+  nginx:
+    build:
+      cache_from: ["type=gha,scope=nginx"]
+      cache_to: ["type=gha,scope=nginx,mode=max,ignore-error=true"]
+
+  php:
+    build:
+      cache_from: ["type=gha,scope=php"]
+      cache_to: ["type=gha,scope=php,mode=max,ignore-error=true"]
+
+  queue:
+    build:
+      cache_from: ["type=gha,scope=php"]
+      cache_to: ["type=gha,scope=php,mode=max,ignore-error=true"]
+
+  scheduler:
+    build:
+      cache_from: ["type=gha,scope=php"]
+      cache_to: ["type=gha,scope=php,mode=max,ignore-error=true"]
+
+  node:
+    build:
+      cache_from: ["type=gha,scope=node"]
+      cache_to: ["type=gha,scope=node,mode=max,ignore-error=true"]
+
+  mysql:
+    build:
+      cache_from: ["type=gha,scope=mysql"]
+      cache_to: ["type=gha,scope=mysql,mode=max,ignore-error=true"]

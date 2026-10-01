@@ -1,0 +1,71 @@
+<!doctype html>
+<!--
+  {{PROJECT_NAME}} — development placeholder.
+
+  Served by Nginx while backend/public/index.php does not exist, so a developer
+  sees proof that Nginx is up and correctly configured — and the next step —
+  instead of a bare FastCGI "File not found" that reads like a broken
+  environment. It disappears on its own the moment the Laravel application is
+  scaffolded.
+-->
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{PROJECT_NAME}} — بيئة التطوير</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font-family: "Segoe UI", system-ui, sans-serif;
+      margin: 0; min-height: 100vh;
+      display: grid; place-items: center;
+      background: #0f1720; color: #e6edf3;
+      line-height: 1.7;
+    }
+    .card {
+      max-width: 46rem; padding: 2.5rem;
+      background: #161b22; border: 1px solid #30363d; border-radius: 12px;
+      margin: 1.5rem;
+    }
+    h1 { margin: 0 0 .25rem; font-size: 1.5rem; }
+    .ok { color: #3fb950; font-weight: 600; }
+    .muted { color: #8b949e; font-size: .95rem; }
+    ul { padding-inline-start: 1.25rem; }
+    li { margin-bottom: .4rem; }
+    code {
+      background: #0d1117; border: 1px solid #30363d; border-radius: 5px;
+      padding: .1rem .4rem; font-size: .9em;
+      font-family: "Cascadia Code", Consolas, monospace;
+      direction: ltr; display: inline-block;
+    }
+    hr { border: 0; border-top: 1px solid #30363d; margin: 1.5rem 0; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>{{PROJECT_NAME}}</h1>
+    <p class="ok">✔ بيئة Docker تعمل بنجاح — Nginx يستجيب.</p>
+
+    <hr>
+
+    <p class="muted">
+      لم يتم إنشاء تطبيق Laravel بعد، لذلك تُعرض هذه الصفحة المؤقتة.
+      ستختفي تلقائيًا بمجرد وجود <code>backend/public/index.php</code>.
+    </p>
+
+    <p>الخدمات المتاحة في بيئة التطوير:</p>
+    <ul>
+      <li>Laravel API — <code>http://localhost:8080</code></li>
+      <li>Vite (React) — <code>http://localhost:5173</code></li>
+      <li>Mailpit — <code>http://localhost:8025</code></li>
+      <li>MySQL — <code>localhost:3306</code></li>
+      <li>Redis — <code>localhost:6379</code></li>
+    </ul>
+
+    <p class="muted">
+      فحص الحالة: <code>/healthz</code> ·
+      حالة PHP-FPM: <code>/fpm-status</code>
+    </p>
+  </div>
+</body>
+</html>

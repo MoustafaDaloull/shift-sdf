@@ -1,0 +1,94 @@
+# =============================================================================
+# {{PROJECT_NAME}} — Git attributes
+# -----------------------------------------------------------------------------
+# WHY THIS FILE EXISTS (and why it is not optional)
+#
+# Development may happen on Windows, but every container runs Linux. Git on
+# Windows defaults to `core.autocrlf=true`, which rewrites LF to CRLF on
+# checkout. A shell script that reaches a Linux container with CRLF line
+# endings fails with:
+#
+#     exec /usr/local/bin/app-entrypoint: no such file or directory
+#
+# — because the kernel reads the shebang as `/bin/sh\r` and looks for an
+# interpreter whose name ends in a carriage return. The error names the script,
+# not the line ending, so it is genuinely hard to diagnose.
+#
+# The rules below force LF for every file that is executed or parsed inside a
+# container, regardless of the developer's local Git configuration.
+# =============================================================================
+
+# Default: let Git normalise text files in the repository, and let the platform
+# decide on checkout.
+* text=auto
+
+# -----------------------------------------------------------------------------
+# MUST BE LF — executed or parsed inside Linux containers
+# -----------------------------------------------------------------------------
+*.sh              text eol=lf
+Dockerfile        text eol=lf
+*.Dockerfile      text eol=lf
+Makefile          text eol=lf
+*.mk              text eol=lf
+
+# Git hooks carry NO extension, so the `*.sh` rule above never reaches them.
+# They are copied into .git/hooks and executed directly; with CRLF the kernel
+# reads the shebang as `/usr/bin/env bash\r` and the hook dies with a message
+# that names the file and never the line ending.
+scripts/hooks/*   text eol=lf
+
+# Config files read by Linux daemons. Nginx and Redis tolerate CRLF
+# inconsistently; MySQL's option-file parser includes the trailing \r in the
+# VALUE, so `character-set-server = utf8mb4\r` becomes an unknown charset and
+# the server refuses to start.
+*.conf            text eol=lf
+*.cnf             text eol=lf
+*.ini             text eol=lf
+*.yaml            text eol=lf
+*.yml             text eol=lf
+
+# Application and environment files consumed by PHP/Node inside containers.
+*.php             text eol=lf
+*.env             text eol=lf
+.env.example      text eol=lf
+.dockerignore     text eol=lf
+.gitignore        text eol=lf
+
+# Web assets — bundlers and hash-based caching are sensitive to line endings.
+*.js              text eol=lf
+*.jsx             text eol=lf
+*.ts              text eol=lf
+*.tsx             text eol=lf
+*.css             text eol=lf
+*.html            text eol=lf
+*.json            text eol=lf
+*.md              text eol=lf
+*.sql             text eol=lf
+
+# -----------------------------------------------------------------------------
+# BINARY — never normalise, never diff
+# -----------------------------------------------------------------------------
+# Normalising a binary file corrupts it: Git would rewrite byte sequences that
+# happen to look like line endings.
+*.png             binary
+*.jpg             binary
+*.jpeg            binary
+*.gif             binary
+*.ico             binary
+*.webp            binary
+*.woff            binary
+*.woff2           binary
+*.ttf             binary
+*.eot             binary
+*.pdf             binary
+*.docx            binary
+*.zip             binary
+
+# -----------------------------------------------------------------------------
+# LINGUIST / DIFF HINTS
+# -----------------------------------------------------------------------------
+# Keep vendored prototype assets out of language statistics and out of diffs,
+# so a review shows the change that matters rather than a wall of minified CSS.
+docs/**           linguist-documentation
+*.min.js          -diff
+*.min.css         -diff

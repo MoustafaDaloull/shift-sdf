@@ -1,0 +1,20 @@
+# Informational in a single-owner project: "Require review from Code Owners" is
+# OFF in the main-branch protection, because there is no second human. The file
+# still shows who owns the governing files in every PR, and that is its use.
+# Independent review = an agent reviewer separate from the executing session +
+# the product owner's sign-off (see PULL_REQUEST_TEMPLATE.md).
+* @{{OWNER_HANDLE}}
+
+# Governing sources and shared surfaces — owned by the integration engineer
+# (informational; the merge decision follows the delegation recorded in the
+# project's decision log).
+/docs/00-product/ @{{OWNER_HANDLE}}
+/docs/01-modules/ @{{OWNER_HANDLE}}
+/CLAUDE*.md @{{OWNER_HANDLE}}
+/PROJECT-BASELINE.md @{{OWNER_HANDLE}}
+/.github/ @{{OWNER_HANDLE}}
+/scripts/ @{{OWNER_HANDLE}}
+/docker/ @{{OWNER_HANDLE}}
+/backend/openapi.json @{{OWNER_HANDLE}}
+/backend/composer.lock @{{OWNER_HANDLE}}
+/frontend/package-lock.json @{{OWNER_HANDLE}}

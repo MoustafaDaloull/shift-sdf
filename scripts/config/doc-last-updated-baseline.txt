@@ -1,0 +1,4 @@
+# doc-last-updated-baseline.txt — دَين `last_updated` المقيس (arch-check.sh · الشقّ (d))
+# سطر لكل ملف يُعرف أن `last_updated` في ترويسته يخالف تاريخ صفّ الإصدار الذي
+# يحمل رقم `document_version` نفسه. تتقلّص ولا تتوسع، كخطّ أساس الشقّ (a).
+# الافتراضي في الإطار: لا دَين.

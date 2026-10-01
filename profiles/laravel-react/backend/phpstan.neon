@@ -1,0 +1,14 @@
+includes:
+    - vendor/larastan/larastan/extension.neon
+
+parameters:
+    paths:
+        - app
+        - database
+        - tests
+
+    # Level 8, and it is not lowered to pass code: a red gate means code to
+    # fix, not a check to silence.
+    level: 8
+
+    tmpDir: storage/framework/cache/phpstan

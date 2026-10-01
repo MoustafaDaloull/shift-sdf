@@ -1,0 +1,12 @@
+# modules.tsv — خريطة الموديولات (مصدر واحد تقرؤه arch-check.sh وscaffold-slice.sh)
+# -----------------------------------------------------------------------------
+# الأعمدة مفصولة بعلامة جدولة (TAB) حرفيًا — لا مسافات:
+#   module_code   كود الموديول بحروف كبيرة كما في المعرّفات (ENT-ORD-001 · TS-ORD-003)
+#   docs_folder   مجلد الحزمة تحت MODULES_DOCS_DIR (ومجلد الواجهة تحت FRONTEND_SRC/modules)
+#   code_folder   مجلد الكود تحت BACKEND_DIR/app/Modules — الاسم كامل بصيغة PascalCase (RS-012)
+#   table_prefix  بادئة كل جدول يُنشئه الموديول، بحروف صغيرة (RS-013 · DMOD-002)
+#
+# مجلد كود غير مسجَّل هنا = خرق RS-012 يُرصد ولا يمرّ صامتًا. وسطر يبدأ بـ# تعليق.
+#
+# module_code	docs_folder	code_folder	table_prefix
+ORD	orders	Orders	ord

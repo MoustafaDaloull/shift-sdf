@@ -1,0 +1,430 @@
+# =============================================================================
+# {{PROJECT_NAME}} — PRODUCTION overlay
+# -----------------------------------------------------------------------------
+# Two supported shapes, and the difference matters:
+#
+#   A. A managed container platform (serverless containers, a managed Kubernetes
+#      service, ...). Compose is NOT the runtime there. This file's role is to
+#      build and locally verify the exact images that platform will run, so
+#      that "works in the pipeline" and "works in production" mean the same
+#      thing.
+#
+#   B. A virtual machine with a container runtime, where this file can run the
+#      stack directly.
+#
+# WHY THERE IS NO MYSQL OR REDIS SERVICE HERE
+# -------------------------------------------
+# They are intentionally removed. Running a database in a container next to the
+# application means owning backups, failover, patching, and point-in-time
+# recovery yourself — for a platform that may handle money. The approved shape
+# uses managed services:
+#     MySQL -> a managed MySQL 8.4 instance
+#     Redis -> two managed Redis instances (see below)
+# Both are reached over a private network using the DB_HOST / REDIS_HOST values
+# injected below. Removing the containers is what makes it impossible to
+# accidentally deploy with a throwaway database.
+#
+# SECRETS
+# -------
+# Nothing sensitive is written here. `${VAR:?}` requires the value to be present
+# in the deployment environment, which is populated from a secret manager and
+# mounted by the platform — never from a committed .env file (no secret in
+# source code or Docker images).
+#
+# USAGE
+#   Build:           make prod-build
+#   Local smoke run: make prod-up   (requires DB_HOST/REDIS_HOST to point
+#                                    somewhere reachable, e.g. a local proxy)
+# =============================================================================
+
+networks:
+  # Kept internal: nothing in production reaches the data plane from the host.
+  backend:
+    internal: true
+
+volumes:
+  # Declared for merge compatibility with the base file. Nothing mounts them in
+  # production — the app containers are stateless by design, which is what lets
+  # a managed platform scale them to zero and back.
+  mysql-data:
+    name: ${COMPOSE_PROJECT_NAME:-app-prod}_unused-mysql-data
+  redis-data:
+    name: ${COMPOSE_PROJECT_NAME:-app-prod}_unused-redis-data
+
+# -----------------------------------------------------------------------------
+# SHARED PRODUCTION SETTINGS
+# -----------------------------------------------------------------------------
+x-prod-logging: &prod-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+    # Emit the container and image name with every line so log entries remain
+    # attributable after the container is gone.
+    tag: "{{.Name}}/{{.ImageName}}"
+
+x-prod-php-build: &prod-php-build
+  context: .
+  dockerfile: docker/php/Dockerfile
+  target: production
+  args:
+    PHP_VERSION: ${PHP_VERSION:-8.5.3}
+    APP_USER: ${APP_USER:-app}
+    APP_UID: "1000"
+    APP_GID: "1000"
+  # BuildKit cache exported to the image registry so a CI runner with no local
+  # cache still gets warm layers. Dramatically shortens pipeline builds.
+  cache_from:
+    - type=registry,ref=${IMAGE_REGISTRY:-local}/php:buildcache
+  cache_to:
+    - type=registry,ref=${IMAGE_REGISTRY:-local}/php:buildcache,mode=max
+
+x-prod-php-env: &prod-php-env
+  APP_ENV: production
+  # Never true in production: debug mode renders stack traces containing file
+  # paths, configuration, and sometimes credentials directly to the API caller.
+  APP_DEBUG: "false"
+  APP_KEY: ${APP_KEY:?APP_KEY must come from the secret manager}
+  APP_URL: ${APP_URL:?APP_URL must be set}
+
+  # Managed MySQL. With an auth proxy as a sidecar this is 127.0.0.1; with a
+  # private IP it is the instance's private address.
+  DB_CONNECTION: mysql
+  DB_HOST: ${DB_HOST:?DB_HOST must point at the managed MySQL instance}
+  DB_PORT: ${DB_PORT:-3306}
+  DB_DATABASE: ${DB_DATABASE:?DB_DATABASE must be set}
+  DB_USERNAME: ${DB_USERNAME:?DB_USERNAME must be set}
+  DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must come from the secret manager}
+
+  # Managed Redis — TWO instances.
+  #
+  # `REDIS_HOST` holds queue jobs and sessions: provision it with
+  # maxmemory-policy=noeviction and persistence ENABLED, because losing a queued
+  # payment or deadline job is data loss.
+  #
+  # `REDIS_CACHE_HOST` holds cache and rate limits: provision it with
+  # maxmemory-policy=allkeys-lru and persistence DISABLED. Eviction here is the
+  # desired behaviour and costs only a recompute.
+  #
+  # Pointing both at the same instance is a configuration error: it reintroduces
+  # exactly the failure mode the split exists to prevent.
+  REDIS_HOST: ${REDIS_HOST:?REDIS_HOST must point at the persistent Redis instance}
+  REDIS_PORT: ${REDIS_PORT:-6379}
+  REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must come from the secret manager}
+  REDIS_CACHE_HOST: ${REDIS_CACHE_HOST:?REDIS_CACHE_HOST must point at the cache Redis instance}
+  REDIS_CACHE_PORT: ${REDIS_CACHE_PORT:-6379}
+  REDIS_CACHE_PASSWORD: ${REDIS_CACHE_PASSWORD:?REDIS_CACHE_PASSWORD must come from the secret manager}
+
+  CACHE_STORE: redis
+  SESSION_DRIVER: redis
+  QUEUE_CONNECTION: redis
+
+  # Structured JSON to stdout. A log collector parses the payload into queryable
+  # fields; a plain-text log would arrive as an opaque string.
+  LOG_CHANNEL: stderr
+  LOG_LEVEL: ${LOG_LEVEL:-warning}
+
+services:
+  # ===========================================================================
+  # MYSQL / REDIS — inherited from the base file and explicitly neutralised
+  # ===========================================================================
+  # The base file defines these so development and testing can run a complete
+  # stack. Production must NOT run them (see the header): data belongs in
+  # managed services.
+  #
+  # `profiles` is how a service is excluded from a stack without deleting it:
+  # a service whose profile is not activated is never created. The profile name
+  # is deliberately one nobody would enable by accident.
+  #
+  # The `!reset` on depends_on below is mandatory and not cosmetic — Compose
+  # refuses to start a service that depends on one excluded by a profile, so
+  # leaving the inherited dependency in place would make this file unusable.
+  mysql:
+    profiles: ["never-in-production"]
+  redis:
+    profiles: ["never-in-production"]
+  redis-cache:
+    profiles: ["never-in-production"]
+
+  # ===========================================================================
+  # NGINX — API edge
+  # ===========================================================================
+  nginx:
+    build:
+      context: .
+      dockerfile: docker/nginx/Dockerfile
+      target: api
+      args:
+        NGINX_VERSION: ${NGINX_VERSION:-1.29}
+    image: ${IMAGE_REGISTRY:-local}/nginx-api:${IMAGE_TAG:-latest}
+
+    # `always`, not `unless-stopped`: a production edge must come back after a
+    # host reboot without a human running `docker compose up`.
+    restart: always
+    logging: *prod-logging
+    networks: [frontend, backend]
+
+    ports:
+      - "${HTTP_PORT:-80}:80"
+
+    depends_on:
+      php:
+        condition: service_healthy
+
+    # -----------------------------------------------------------------------
+    # Hardening
+    # -----------------------------------------------------------------------
+    # read_only root filesystem: the container cannot be modified at runtime, so
+    # a compromise cannot drop a webshell or persist anything across a restart.
+    # Every path Nginx genuinely needs to write is provided as tmpfs below.
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=64m
+      - /var/run:mode=0755,size=8m
+      - /var/cache/nginx:mode=0755,size=128m
+
+    security_opt:
+      # Prevent a process from gaining privileges via setuid binaries — closes
+      # the standard container-escalation path.
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+    cap_add:
+      # The only capability Nginx needs: bind port 80 as a non-root worker.
+      # Everything else (raw sockets, kernel module loading, chown) is dropped.
+      - NET_BIND_SERVICE
+
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+        reservations:
+          cpus: "0.25"
+          memory: 64M
+
+  # ===========================================================================
+  # PHP-FPM — Laravel API
+  # ===========================================================================
+  php:
+    build: *prod-php-build
+    image: ${IMAGE_REGISTRY:-local}/php:${IMAGE_TAG:-latest}
+    restart: always
+    logging: *prod-logging
+    networks: [backend]
+    environment:
+      <<: *prod-php-env
+      # `static` rather than `dynamic`: a managed instance serves a bounded,
+      # known concurrency, so forking workers on demand adds latency to the
+      # request path for no benefit. A fixed pool is warm from the first request.
+      PHP_FPM_PM: static
+      PHP_FPM_MAX_CHILDREN: ${PHP_FPM_MAX_CHILDREN:-16}
+
+    # Drops the inherited "wait for the mysql/redis containers" dependency:
+    # those containers do not exist here. Readiness against managed services is
+    # a network concern handled by the platform and by Laravel's own connection
+    # retry, not by Compose ordering.
+    depends_on: !reset null
+
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=128m
+      - /var/run:mode=0755,size=8m
+      # Laravel must write compiled views, framework caches, and logs. This is a
+      # tmpfs rather than a volume precisely BECAUSE it should not persist:
+      # every replica rebuilds its own cache, and no state survives a deploy.
+      - /var/www/html/storage:mode=0770,uid=1000,gid=1000,size=512m
+      - /var/www/html/bootstrap/cache:mode=0770,uid=1000,gid=1000,size=64m
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          # Must exceed PHP_FPM_MAX_CHILDREN x memory_limit in the worst case.
+          # 16 x 256M is a theoretical 4G, but real Laravel workers average far
+          # below their ceiling; 2G with monitoring is the pragmatic starting
+          # point. Tune from actual monitoring data, not from this guess.
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+
+  # ===========================================================================
+  # QUEUE WORKER
+  # ===========================================================================
+  queue:
+    build: *prod-php-build
+    image: ${IMAGE_REGISTRY:-local}/php:${IMAGE_TAG:-latest}
+    restart: always
+    logging: *prod-logging
+    networks: [backend]
+    environment:
+      <<: *prod-php-env
+    command: >
+      php artisan queue:work
+      --queue=high,default,low
+      --tries=3
+      --backoff=10,30,60
+      --max-time=3600
+      --max-jobs=1000
+      --sleep=3
+
+    # See the note on the php service: managed data services, not containers.
+    depends_on: !reset null
+
+    # A payment-gateway call or a media transcode must be allowed to finish.
+    # SIGTERM tells Laravel to stop accepting new jobs and drain the current one;
+    # this window is how long we wait before SIGKILL.
+    stop_grace_period: 120s
+
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=256m
+      - /var/run:mode=0755,size=8m
+      - /var/www/html/storage:mode=0770,uid=1000,gid=1000,size=512m
+      - /var/www/html/bootstrap/cache:mode=0770,uid=1000,gid=1000,size=64m
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    healthcheck:
+      disable: true
+
+    deploy:
+      # Horizontal scale point: raise this for bursts of background work. Safe
+      # to scale because queue jobs are pulled, not pushed — workers compete for
+      # jobs and Redis guarantees each is handed to exactly one worker.
+      replicas: ${QUEUE_REPLICAS:-2}
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  # ===========================================================================
+  # SCHEDULER — DISABLED IN PRODUCTION BY DEFAULT
+  # ===========================================================================
+  # Scheduled work on an autoscaling platform is driven by an EXTERNAL
+  # scheduler (a managed cron service invoking an HTTP endpoint), not by this
+  # container. It is kept here, behind a profile, only for deployments where
+  # replica count can genuinely be pinned to one.
+  #
+  # WHY NOT A CONTAINER ON AN AUTOSCALING PLATFORM
+  # `schedule:work` is correct only if EXACTLY ONE instance ever runs. An
+  # autoscaling platform can hold more than one instance during a deploy
+  # overlap, a traffic spike, or a health-check replacement. Two schedulers
+  # means every scheduled task fires twice: a fee charged twice, a notification
+  # sent twice, a deadline closed twice. Those are irreversible, money-touching
+  # errors, and `withoutOverlapping()` does not protect against them — it
+  # guards a single instance against slow runs, not two separate containers
+  # racing.
+  #
+  # THE APPROVED SETUP
+  #   1. Laravel exposes a scheduler endpoint (for example POST /internal/schedule/run)
+  #      that calls Artisan::call('schedule:run') and returns 204.
+  #   2. The route is restricted to the scheduler's service identity — a
+  #      verified identity token, NOT a shared secret in a header.
+  #   3. The managed scheduler invokes it every minute.
+  #   4. The managed scheduler guarantees a single delivery per tick and retries
+  #      on failure, which is the property the container model cannot provide.
+  #
+  # To run the container form anyway (pinned-replica platforms only):
+  #   docker compose --profile self-hosted-scheduler up -d
+  scheduler:
+    profiles: ["self-hosted-scheduler"]
+    build: *prod-php-build
+    image: ${IMAGE_REGISTRY:-local}/php:${IMAGE_TAG:-latest}
+    restart: always
+    logging: *prod-logging
+    networks: [backend]
+    environment:
+      <<: *prod-php-env
+    command: php artisan schedule:work
+    stop_grace_period: 60s
+
+    # See the note on the php service: managed data services, not containers.
+    depends_on: !reset null
+
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=128m
+      - /var/run:mode=0755,size=8m
+      - /var/www/html/storage:mode=0770,uid=1000,gid=1000,size=256m
+      - /var/www/html/bootstrap/cache:mode=0770,uid=1000,gid=1000,size=64m
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    healthcheck:
+      disable: true
+
+    deploy:
+      # EXACTLY ONE, and this is only safe on a platform where replica count is
+      # actually enforced. That constraint is precisely why an autoscaling
+      # deployment uses an external scheduler instead — see the block above.
+      replicas: 1
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 128M
+
+  # ===========================================================================
+  # WEB — React SPA (static)
+  # ===========================================================================
+  # Separate service and separate image from the API, matching an architecture
+  # where the frontend deploys independently of the backend.
+  #
+  # Requires the Node `build` image to exist first — `make prod-build` builds it
+  # and passes its tag through NODE_BUILD_IMAGE.
+  web:
+    build:
+      context: .
+      dockerfile: docker/nginx/Dockerfile
+      target: web
+      args:
+        NGINX_VERSION: ${NGINX_VERSION:-1.29}
+        NODE_BUILD_IMAGE: ${IMAGE_REGISTRY:-local}/node-build:${IMAGE_TAG:-latest}
+    image: ${IMAGE_REGISTRY:-local}/web:${IMAGE_TAG:-latest}
+    restart: always
+    logging: *prod-logging
+    # Frontend only: static files, no data-plane access whatsoever.
+    networks: [frontend]
+    ports:
+      - "${WEB_PORT:-8081}:80"
+
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=32m
+      - /var/run:mode=0755,size=8m
+      - /var/cache/nginx:mode=0755,size=64m
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+        reservations:
+          cpus: "0.1"
+          memory: 32M

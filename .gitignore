@@ -1,0 +1,14 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# local scratch — never framework content
+/tmp/
+/scratch/
+
+# node / php artefacts if a profile is tried locally
+node_modules/
+vendor/

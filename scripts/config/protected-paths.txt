@@ -1,0 +1,37 @@
+# protected-paths.txt — المسارات المحمية التي لا تتغيّر من مرحلة التنفيذ
+# -----------------------------------------------------------------------------
+# glob واحد في كل سطر، نسبي إلى جذر المستودع. `*` يطابق مقطعًا واحدًا (لا يعبر `/`).
+# تعديل ملف يطابق سطرًا هنا بلا معرّف Change Request في سجل الالتزامات يُفشل
+# protected-paths-check.sh. الاستثناءات الثلاثة فقط: Change Request معتمد ·
+# تصحيح خطأ واقعي بإذن مالك المنتج · تحديث أعمدة التقدم.
+# سطر يبدأ بـ# تعليق، والفراغات تُهمَل.
+
+# وثائق التحليل (Phase 0) لكل موديول
+docs/01-modules/*/requirements.md
+docs/01-modules/*/business-rules.md
+docs/01-modules/*/user-flows.md
+docs/01-modules/*/screen-inventory.md
+docs/01-modules/*/permission-matrix.md
+docs/01-modules/*/screens/*.md
+
+# الحزمة الهندسية لكل موديول — العقد الذي يُنفَّذ
+docs/01-modules/*/data-model.md
+docs/01-modules/*/api-contracts.md
+docs/01-modules/*/user-stories.md
+docs/01-modules/*/test-scenarios.md
+
+# وثائق المنتج العالمية
+docs/00-product/brd.md
+docs/00-product/glossary.md
+docs/00-product/business-rules-global.md
+
+# المرجع البصري الحاكم
+docs/02-design/design-system.md
+
+# المعايير والمعمارية وسجلات القرارات المعمارية
+docs/03-development/*-standard.md
+docs/03-development/architecture.md
+docs/03-development/adr/*
+
+# إطار المرحلة المؤرشفة
+CLAUDE-PHASE0.md

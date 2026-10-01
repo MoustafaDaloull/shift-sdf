@@ -1,0 +1,303 @@
+# =============================================================================
+# {{PROJECT_NAME}} — DEVELOPMENT overlay
+# -----------------------------------------------------------------------------
+# Merged on top of compose.yaml. Optimised for iteration speed and inspectability:
+# source is bind-mounted, ports are published to the host, Xdebug is available,
+# and Mailpit captures all outbound mail.
+#
+#   docker compose --project-directory . \
+#     -f docker/compose/compose.yaml -f docker/compose/compose.dev.yaml up -d
+#
+# or simply: `make up`
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# NETWORK OVERRIDE
+# -----------------------------------------------------------------------------
+# The base file marks `backend` as internal, which severs it from the host. In
+# development we relax that so a database GUI (TablePlus, DBeaver, RedisInsight)
+# can connect from the host. This is a deliberate, development-only reduction in
+# isolation — compose.test.yaml and compose.prod.yaml both keep it internal.
+networks:
+  backend:
+    internal: false
+
+services:
+  # ===========================================================================
+  # NGINX
+  # ===========================================================================
+  nginx:
+    build:
+      target: development
+    ports:
+      # Host 8080 rather than 80: binding a privileged port needs elevation on
+      # some setups, and 80 is frequently already taken on a developer machine
+      # by IIS or another local stack.
+      - "${NGINX_PORT:-8080}:80"
+    volumes:
+      # Read-only: Nginx serves static files from public/ and must never be able
+      # to write into the source tree. If an upload needs to land in public/, it
+      # is PHP that writes it, through its own read-write mount.
+      - ./backend:/var/www/html:ro
+      # Live-edit the vhost and reload with `docker compose exec nginx nginx -s
+      # reload` — no image rebuild for a config change.
+      #
+      # Mount the SINGLE dev vhost as default.conf — never the whole conf.d
+      # directory. nginx.conf does `include /etc/nginx/conf.d/*.conf`, so
+      # mounting the directory would load laravel.dev.conf, laravel.prod.conf,
+      # AND spa.prod.conf simultaneously, and nginx refuses to start with
+      # "duplicate upstream php_fpm". The image already places the correct
+      # vhost per build target; this mount only makes it live-editable.
+      - ./docker/nginx/conf.d/laravel.dev.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./docker/nginx/snippets:/etc/nginx/snippets:ro
+    depends_on:
+      php:
+        condition: service_healthy
+
+  # ===========================================================================
+  # PHP-FPM
+  # ===========================================================================
+  php:
+    build:
+      target: development
+    volumes:
+      # Read-write: artisan writes migrations, caches, and logs.
+      # `:cached` relaxes host->container consistency guarantees, which is a
+      # significant throughput win on Docker Desktop's filesystem bridge and is
+      # safe for source files (the container never needs to see a host write
+      # within the same millisecond).
+      - ./backend:/var/www/html:cached
+      # Named volume mounted OVER the bind mount at vendor/. This is the key
+      # trick: it keeps Composer's thousands of files inside the Linux VM's
+      # native filesystem instead of crossing the Windows bridge, which turns a
+      # multi-minute `composer install` into seconds. The host's backend/vendor
+      # stays empty, which is fine — the IDE reads it from the container or from
+      # a separate host-side install.
+      - backend-vendor:/var/www/html/vendor
+    environment:
+      APP_ENV: local
+      APP_DEBUG: "true"
+
+      # `off` keeps Xdebug loaded but inert (near-zero overhead). Switch per
+      # session without a rebuild:
+      #   XDEBUG_MODE=debug docker compose up -d php
+      XDEBUG_MODE: ${XDEBUG_MODE:-off}
+
+      # Install Composer dependencies automatically on first boot once
+      # composer.json exists. Development-only: see docker/php/entrypoint.sh.
+      COMPOSER_AUTO_INSTALL: "true"
+
+      # Full demonstration data on every `migrate --seed`: `APP_DEMO_SEED=true`
+      # in the root .env marks this stack as a demonstration stack. Off by
+      # default — a plain development database gets none of it; the demo
+      # seeder can always be invoked by class name on demand.
+      APP_DEMO_SEED: ${APP_DEMO_SEED:-false}
+
+    # The image's health probe is sized for a warm container where FPM answers
+    # within a second. Here the entrypoint installs vendor/ *before* it execs
+    # php-fpm, so on a cold volume the first probe cannot succeed until Composer
+    # finishes — and the image's 30s start period would mark the container
+    # unhealthy for doing precisely what it was told to do. The probe command
+    # itself is restated because a healthcheck block that omits `test` is not a
+    # reliable way to inherit the image's.
+    healthcheck:
+      test: ["CMD", "app-healthcheck"]
+      interval: 15s
+      timeout: 5s
+      start_period: 300s
+      retries: 5
+
+    # Xdebug connects OUT from the container to the IDE. Docker Desktop provides
+    # `host.docker.internal` automatically; this line adds it explicitly so the
+    # same file also works on native Linux Docker Engine, where the alias does
+    # not exist and Xdebug would otherwise fail to resolve the IDE host.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ===========================================================================
+  # QUEUE WORKER
+  # ===========================================================================
+  queue:
+    build:
+      target: development
+    volumes:
+      - ./backend:/var/www/html:cached
+      - backend-vendor:/var/www/html/vendor
+    environment:
+      APP_ENV: local
+      APP_DEBUG: "true"
+      XDEBUG_MODE: "off"
+    # Development only, and only because of how vendor/ arrives here.
+    #
+    # The base file has this worker wait on mysql and redis, which is right in
+    # production where vendor/ is baked into the image. In development it is not
+    # enough: vendor/ is a named volume that the php service's entrypoint fills
+    # via COMPOSER_AUTO_INSTALL, and this container mounts the same volume. Left
+    # to the base ordering it starts as soon as redis is healthy — roughly
+    # twelve seconds in — while vendor/ is still empty, so `php artisan` dies on
+    # a missing autoloader and the restart policy loops it until the install
+    # finishes. Waiting on php instead is waiting on the thing that actually
+    # produces the dependency: php reports healthy only after its entrypoint has
+    # installed vendor/ and FPM answers.
+    #
+    # This is startup ordering, not health coupling — the worker still reports
+    # only its own health, which is the rule docker/README.md §4.4 states.
+    depends_on:
+      php:
+        condition: service_healthy
+    # `--tries=1` in development: a failing job should surface immediately with
+    # its real stack trace instead of being retried three times, which buries
+    # the original error under duplicate log noise.
+    command: >
+      php artisan queue:work
+      --queue=high,default,low
+      --tries=1
+      --max-time=3600
+      --sleep=3
+      --verbose
+
+  # ===========================================================================
+  # SCHEDULER
+  # ===========================================================================
+  scheduler:
+    build:
+      target: development
+    volumes:
+      - ./backend:/var/www/html:cached
+      - backend-vendor:/var/www/html/vendor
+    environment:
+      APP_ENV: local
+      XDEBUG_MODE: "off"
+    # Same vendor-volume ordering as the queue worker above.
+    depends_on:
+      php:
+        condition: service_healthy
+
+  # ===========================================================================
+  # NODE / VITE — React 19 + TypeScript
+  # ===========================================================================
+  node:
+    build:
+      context: .
+      dockerfile: docker/node/Dockerfile
+      target: development
+      args:
+        NODE_VERSION: ${NODE_VERSION:-22.21}
+        APP_USER: ${APP_USER:-app}
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # Frontend only — it has no business reaching MySQL or Redis directly. The
+    # SPA talks to the API over HTTP like any other client.
+    networks: [frontend]
+    ports:
+      # Vite's dev server and HMR websocket share this port.
+      - "${VITE_PORT:-5173}:5173"
+    volumes:
+      - ./frontend:/app:cached
+      # Same rationale as backend-vendor: node_modules must stay in the Linux
+      # filesystem. It also prevents the container's Linux-compiled native
+      # modules (esbuild, rollup) from overwriting host binaries.
+      - frontend-node-modules:/app/node_modules
+    environment:
+      NODE_ENV: development
+      # Vite must bind 0.0.0.0; bound to localhost it is unreachable from the
+      # host even with the port published.
+      VITE_HOST: 0.0.0.0
+      VITE_PORT: 5173
+      # Set to false if the repository lives inside the WSL2 filesystem
+      # (\\wsl$\...), where native inotify events work and polling only burns
+      # CPU. Required when the repository is on a Windows drive.
+      CHOKIDAR_USEPOLLING: ${CHOKIDAR_USEPOLLING:-true}
+      # Baked into the bundle at build time; points the SPA at the local API.
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8080}
+
+  # ===========================================================================
+  # MYSQL
+  # ===========================================================================
+  mysql:
+    ports:
+      # Published so a GUI client can connect from the host. Bound to 127.0.0.1
+      # explicitly — without the interface prefix Docker binds 0.0.0.0 and the
+      # database becomes reachable by anyone on the same network (a coffee-shop
+      # Wi-Fi, a corporate LAN). This is a real and frequently exploited
+      # exposure, not a theoretical one.
+      - "127.0.0.1:${MYSQL_PORT:-3306}:3306"
+    # Volumes and the server config are inherited unchanged from the base file.
+
+  # ===========================================================================
+  # REDIS (PERSISTENT) — queue + sessions
+  # ===========================================================================
+  redis:
+    ports:
+      # Same 127.0.0.1 binding rationale as MySQL above.
+      #
+      # The HOST port has its own variable, REDIS_HOST_PORT, exactly as MySQL's
+      # host port is MYSQL_PORT while the app's in-network port is DB_PORT.
+      # REDIS_PORT is what compose.yaml hands the app — the port INSIDE the
+      # network, always 6379. One variable for both meant that shifting the
+      # host port (an isolated worktree gives every tree +10/+20/…) also
+      # pointed the app at redis:6389, where nothing listens: every
+      # Redis-backed path answered 500 in every isolated tree.
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
+
+  # ===========================================================================
+  # REDIS (CACHE)
+  # ===========================================================================
+  # Published on a DIFFERENT host port so a developer can inspect the two
+  # instances side by side in RedisInsight and see which data lives where —
+  # which is the whole point of separating them.
+  redis-cache:
+    ports:
+      # Host port only — REDIS_CACHE_HOST_PORT, for the same reason as above:
+      # giving the host mapping its own name stops REDIS_CACHE_PORT meaning
+      # two things.
+      - "127.0.0.1:${REDIS_CACHE_HOST_PORT:-6380}:6379"
+
+  # ===========================================================================
+  # MAILPIT — SMTP capture (development and testing only)
+  # ===========================================================================
+  # See docker/mailpit/README.md for the full rationale. In short: it guarantees
+  # that no OTP, receipt, or notification can reach a real inbox from a
+  # development machine, while still letting a developer inspect the rendered
+  # message — including Arabic RTL layout.
+  mailpit:
+    image: axllent/mailpit:${MAILPIT_VERSION:-v1.28}
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    # On both networks: PHP reaches SMTP over `backend`, and the developer
+    # reaches the web UI through `frontend`.
+    networks: [frontend, backend]
+    ports:
+      - "127.0.0.1:${MAILPIT_UI_PORT:-8025}:8025"
+    volumes:
+      - mailpit-data:/data
+    environment:
+      # Persist captured mail across restarts so a debugging session survives a
+      # `docker compose restart`.
+      MP_DATABASE: /data/mailpit.db
+      # Cap the store: a queue-worker loop that re-sends a notification could
+      # otherwise fill the disk.
+      MP_MAX_MESSAGES: ${MAILPIT_MAX_MESSAGES:-500}
+      # Accept any credentials over plaintext. Safe on an internal-only network,
+      # and it lets backend/.env keep production-shaped mail settings.
+      MP_SMTP_AUTH_ACCEPT_ANY: "1"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "1"
+      TZ: ${TZ:-UTC}
+    healthcheck:
+      # The image ships a purpose-built healthcheck subcommand; it is preferred
+      # over curl because the image contains no shell utilities to rely on.
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

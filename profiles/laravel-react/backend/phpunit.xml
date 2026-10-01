@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:noNamespaceSchemaLocation="vendor/phpunit/phpunit/phpunit.xsd"
+         bootstrap="vendor/autoload.php"
+         colors="true"
+
+         failOnWarning="true"
+         failOnRisky="true"
+         failOnNotice="true"
+><!--
+        Advisory checks are forbidden: a gate that only warns is ignored within
+        a fortnight. PHPUnit's default is exactly that — it reports issues and
+        exits 0 — so these three turn its own findings into build failures.
+
+        WHAT THESE DO NOT COVER, measured rather than assumed. A CI run printed
+
+            Tests:  19 warnings (38 assertions)
+
+        and the pipeline called the gate passed. Adding the attributes below did
+        NOT change that exit code, because PHPUnit never saw an issue: run
+        directly, `vendor/bin/phpunit` reports `OK` on the very same code. The
+        warnings are surfaced by Collision, which `php artisan test` runs
+        through and which reports PHP diagnostics that PHPUnit's handler
+        discards — including ones raised under `@`.
+
+        So the guard against a warning-flavoured green lives in
+        scripts/quality.sh, which inspects the summary line. These attributes
+        are still correct, and still worth having for issues PHPUnit does own —
+        they are simply not what closes that hole.
+
+        `failOnDeprecation` is deliberately NOT set: a deprecation raised inside
+        a dependency would fail this build for something no one here can fix in
+        the same commit, which turns a red build into noise to be routed around.
+-->
+
+    <!--
+        RS-040 defines four homes for tests. Three of them are PHP and belong
+        here; the fourth is frontend and runs under its own tooling.
+
+        `Integration` holds contract tests that cross a module boundary — the
+        tests that prove the module-to-module contracts hold, which is the
+        single most important thing to verify in a modular monolith. If nothing
+        declares that directory, PHPUnit never collects it: such a test would
+        be written, committed, reported as passing by a green suite, and never
+        once executed.
+
+        Each directory carries a tracked .gitkeep. Git does not track empty
+        directories, and PHPUnit aborts the entire run — not skips — when a
+        declared testsuite directory is absent:
+
+            Test directory "/var/www/html/tests/Unit" not found
+
+        That failed a CI run: tests/Unit existed on the development machine as
+        leftover scaffolding and was invisible to git, so the suite ran locally
+        and could not run from a clean clone.
+    -->
+    <testsuites>
+        <testsuite name="Unit">
+            <directory>tests/Unit</directory>
+        </testsuite>
+        <testsuite name="Feature">
+            <directory>tests/Feature</directory>
+        </testsuite>
+        <testsuite name="Integration">
+            <directory>tests/Integration</directory>
+        </testsuite>
+    </testsuites>
+    <source>
+        <include>
+            <directory>app</directory>
+        </include>
+    </source>
+    <php>
+        <env name="APP_ENV" value="testing"/>
+        <env name="APP_MAINTENANCE_DRIVER" value="file"/>
+        <env name="BCRYPT_ROUNDS" value="4"/>
+        <env name="BROADCAST_CONNECTION" value="null"/>
+        <!--
+            These two lines do NOT apply inside the isolated test stack.
+
+            PHPUnit's `<env>` never overwrites a variable already present in
+            the environment (without `force="true"`), and
+            docker/compose/compose.test.yaml exports `CACHE_STORE: redis` to
+            the runner — so Redis wins, not `array`. That is intended and
+            stays: the cache is tested on the engine that ships (the same
+            reasoning as MySQL over SQLite below).
+
+            Its effect on isolation is handled by `Tests\TestCase::setUp`,
+            which flushes the cache before every test — because
+            `RefreshDatabase` rolls back the database and knows nothing about
+            the cache. The two lines remain for a run outside the stack, where
+            no environment variable precedes them.
+        -->
+        <env name="CACHE_STORE" value="array"/>
+        <env name="CACHE_LIMITER" value="array"/>
+
+        <!--
+            Tests run on MySQL, not on in-memory SQLite.
+
+            Laravel's skeleton default is sqlite::memory: and it is faster, but
+            it voids what is being tested: an append-only guarantee enforced by
+            MySQL triggers does not exist on SQLite — the tests pass green while
+            the constraint is absent.
+
+            Testing on an engine other than the production engine is false
+            confidence. The *_test database is created by docker/mysql/initdb
+            for exactly this purpose, and the isolated stack is torn down after
+            the run.
+        -->
+        <env name="DB_CONNECTION" value="mysql"/>
+        <env name="DB_DATABASE" value="app_test"/>
+        <env name="DB_URL" value=""/>
+        <env name="MAIL_MAILER" value="array"/>
+        <env name="QUEUE_CONNECTION" value="sync"/>
+        <env name="SESSION_DRIVER" value="array"/>
+        <env name="PULSE_ENABLED" value="false"/>
+        <env name="TELESCOPE_ENABLED" value="false"/>
+        <env name="NIGHTWATCH_ENABLED" value="false"/>
+    </php>
+</phpunit>

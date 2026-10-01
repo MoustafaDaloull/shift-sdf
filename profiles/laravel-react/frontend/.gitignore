@@ -1,0 +1,26 @@
+# Build output and dependencies
+node_modules/
+dist/
+
+# Playwright run artefacts. The BASELINES are not here - they live in
+# tests/**/*-snapshots/ and are committed on purpose: a reference image that is
+# not in version control is not a reference, and the visual gate would compare
+# each run against whatever the last run happened to produce.
+playwright-report/
+test-results/
+
+# Full gate output, kept so a red can be classified after the run ends (a load
+# timeout is UNMEASURED, a real assertion is FAIL - and the difference is only
+# readable in the error text). Playwright wipes test-results/ between projects
+# and the `list` reporter writes no file, so without this the evidence died
+# with the stage.
+gate-logs/
+
+# TRAP, learned the hard way: do NOT add a secrets pattern such as
+# `credentials*` or `secrets*` here "to be safe". On a case-insensitive
+# filesystem (Windows, macOS default) it silently ignores a NEW source file
+# named `Credentials*.tsx` or `SecretsPanel.tsx`: the file exists locally, the
+# gates are green locally, and CI is red on a module that does not exist in
+# the commit. The secret scan (scripts/secret-scan.sh) guards content; this
+# file guards artefacts. If such a pattern must exist, anchor it to the root
+# (`/credentials.json`) rather than a glob.

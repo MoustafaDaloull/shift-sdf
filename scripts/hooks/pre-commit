@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# =============================================================================
+# pre-commit — الطبقة الثانية من الفرض (AS-020)
+# -----------------------------------------------------------------------------
+# يُثبَّت بـ: make hooks   (أو نسخه إلى .git/hooks/pre-commit مع chmod +x)
+#
+# مبدأ AS-001 (الفشل مبكرًا): كل فحص يُنفَّذ في أدنى طبقة ممكنة. خطأ تنسيق
+# يُكتشف في CI بعد سبع دقائق يكلّف دورة كاملة؛ الخطأ نفسه هنا يكلّف ثانيتين.
+#
+# ما يُفحص هنا وما لا يُفحص:
+#   هنا  — سريع ويعمل على المُدرَج فقط: الأسرار · التنسيق · الأنواع الصارمة
+#   CI   — بطيء ويحتاج قاعدة بيانات: الاختبارات · PHPStan · Deptrac
+#
+# التجاوز: git commit --no-verify — للطوارئ فقط ويُذكر سببه في رسالة الالتزام
+#          (AS-021). فحص الأسرار لا يُتجاوَز بحال.
+# =============================================================================
+
+set -uo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT" || exit 1
+
+# shellcheck source=../config/shift.env
+. "$ROOT/scripts/config/shift.env" || exit 2
+
+FAILED=0
+red()   { printf '\033[31m%s\033[0m\n' "$1"; }
+green() { printf '\033[32m%s\033[0m\n' "$1"; }
+dim()   { printf '\033[2m%s\033[0m\n' "$1"; }
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$STAGED" ] && exit 0
+
+echo
+dim "pre-commit — $PROJECT_NAME"
+
+# ── 1) الأسرار وملفات البيئة — غير قابل للتجاوز ─────────────────────────────
+if ! bash scripts/secret-scan.sh; then
+    FAILED=1
+fi
+
+# ── 2) الأنواع الصارمة في ملفات PHP الجديدة (CS-010) ────────────────────────
+PHP_STAGED=$(echo "$STAGED" | grep -E "^$BACKEND_DIR/(app|tests|database)/.*\.php$" || true)
+if [ -n "$PHP_STAGED" ]; then
+    MISSING=""
+    for f in $PHP_STAGED; do
+        [ -f "$f" ] || continue
+        head -5 "$f" | grep -q "declare(strict_types=1)" || MISSING="$MISSING\n    $f"
+    done
+    if [ -n "$MISSING" ]; then
+        red "✗ CS-010 — ملف PHP بلا declare(strict_types=1):"
+        printf "$MISSING\n"
+        FAILED=1
+    else
+        green "✓ CS-010 — الأنواع الصارمة"
+    fi
+fi
+
+# ── 3) التنسيق (Pint) على المُدرَج فقط ──────────────────────────────────────
+# يعمل داخل الحاوية إن كانت تعمل؛ وإلا يُتخطّى بتنبيه — لا يُفشِل الالتزام
+# لأن المطوّر قد يعمل بلا Docker مؤقتًا، وCI يفرضه على أي حال.
+#
+# ── والحارسُ كان لا يحرس ───────────────────────────────────────────────────
+# كان الشرطُ `ps php --status running`، و`docker compose ps` **يعود بصفرٍ حتى
+# حين لا يطابق شيئًا** — يطبع فراغًا ولا يفشل. فالفرعُ الأولُ يُؤخَذ دائمًا،
+# ويسقط `exec -T php` لغياب الحاوية، فيُبلَّغ **عطبَ تنسيقٍ لم يقع**.
+#
+# وأثرُه كان على كل شجرة عمل معزولة: حزمتُها معزولةٌ باسمها، فأولُ التزامٍ
+# منها قبل إقلاعها يُرفض برسالةٍ كاذبة — والفرعُ الثاني المكتوبُ لهذه الحالة
+# بعينها لا يُبلَغ أبدًا.
+#
+# و`ps -q php` يعطي الجوابَ الصحيح: سطرُ معرّفٍ لكل حاويةٍ قائمة، وفراغٌ حين
+# لا شيء. **ولا يُضعَّف شيء:** التنسيقُ يبقى مفروضًا في `quality.sh` وفي CI.
+if [ -n "$PHP_STAGED" ]; then
+    DC="docker compose --project-directory . -f $COMPOSE_DIR/$COMPOSE_BASE_FILE -f $COMPOSE_DIR/$COMPOSE_DEV_FILE"
+    if [ -n "$($DC ps -q "$PHP_SERVICE" 2>/dev/null)" ]; then
+        REL=$(echo "$PHP_STAGED" | sed "s|^$BACKEND_DIR/||" | tr '\n' ' ')
+        if $DC exec -T "$PHP_SERVICE" sh -lc "cd $PHP_WORKDIR && ./vendor/bin/pint --test $REL" >/dev/null 2>&1; then
+            green "✓ التنسيق (Pint)"
+        else
+            red "✗ التنسيق — شغّل: make fmt  (أو: $DC exec $PHP_SERVICE ./vendor/bin/pint)"
+            FAILED=1
+        fi
+    else
+        dim "⊘ Pint — الحاوية متوقفة، يُفرَض في CI"
+    fi
+fi
+
+echo
+if [ "$FAILED" -eq 1 ]; then
+    red "الالتزام مرفوض"
+    exit 1
+fi
+green "pre-commit — نظيف"
+echo
+exit 0

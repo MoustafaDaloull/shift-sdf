@@ -1,0 +1,6 @@
+# Line endings are part of correctness here: shell scripts, hooks and container
+# entrypoints must stay LF on every platform (a CRLF shebang does not execute).
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.woff2 binary

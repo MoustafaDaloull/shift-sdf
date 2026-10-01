@@ -1,0 +1,338 @@
+# =============================================================================
+# خط التكامل — {{PROJECT_NAME}}
+# -----------------------------------------------------------------------------
+# المنصة: GitHub Actions.
+#
+# مبدأ حاكم: هذا الملف **لا يعرّف تسلسل الفحوص** — يستدعي scripts/quality.sh
+# الذي يعرّفه. تسلسل مكرَّر في موضعين يتباعد عند أول تغيير لا يُطابَق، ويصبح
+# «أخضر محليًا وأحمر في CI» عادةً بدل أن يكون إشارة.
+#
+# **ولا يعرّف قائمةَ مهامّه أيضًا**: المهمةُ `plan` تسأل `quality.sh --list-shards`
+# عنها، والسكربتُ يشتقّها من المفعّل في تسلسله. فبوابةٌ تُفعّل أو توقف لاحقًا
+# تنعكس هنا بلا قائمةٍ ثانية قابلة للانحراف.
+#
+# ما يتوقعه هذا الملف من مجلد scripts/ (يأتي مع إطار Shift SDF):
+#   scripts/quality.sh               التسلسل الواحد · --list-shards · --shard=<name>
+#   scripts/protected-paths-check.sh  وثائق التحليل لا تتغيّر بلا Change Request
+# =============================================================================
+
+name: CI
+
+# لماذا `[main]` لا `**`: **المراجعة والتصحيح محليًّا أوّلًا، ثم دفعةٌ نهائيةٌ
+# واحدةٌ مخطَّطة، ثم تشغيلةُ merge-candidate للبوابات واحدةٌ على البصمة النهائية.**
+# GitHub Actions ليس حلقةَ تطويرٍ تكرارية. الكودُ يُفحص قبل الدفع لا بعده،
+# **ولا تُترك دفعةٌ بلا فحص**: الفرقُ أن الفاحصَ صار المنفِّذَ محليًّا لا مُشغِّلًا
+# سحابيًّا يُستدعى بعد كل تعليق.
+#
+# **وما لم يتغيّر:** الفحصُ المطلوب على `main` يبقى «بوابات الجودة» حرفيًّا،
+# وحمايةُ `main` بحالها، ودليلُ إغلاق الشريحة يبقى تشغيلةً سحابيةً خضراء لا
+# تشغيلًا محليًّا.
+#
+# `workflow_dispatch` مُطلِقٌ يدويٌّ للتسلسل التلقائي على فرع عملٍ عند الحاجة،
+# فلا تُحبَس شريحةٌ خلف الدمج لتُغلق. **ويحمل مُدخلًا واحدًا لإثبات البوابة
+# بالفشل المتعمَّد** — انظر `break_shard` أدناه.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      # «البوابة لا تُعدّ عاملة قبل أن تفشل عمدًا». الجديدُ في هذا الملف هو
+      # **الجمع**: مهامٌّ متوازية تحكم بها مهمةٌ جامعة. فالإثباتُ المطلوب أن
+      # سقوطَ مهمةٍ واحدةٍ يُسقط الجامعة — وهذا المُدخل يُسقط مهمةً بعينها عمدًا
+      # في تشغيلةٍ يدوية. لا يُطلَق إلا بـ`workflow_dispatch`، وافتراضيُّه فارغ،
+      # فلا يمسّ أيَّ تشغيلة `push` أو `pull_request`.
+      break_shard:
+        description: "اسم مهمة تُكسر عمدًا لإثبات أن «بوابات الجودة» تحمرّ (فارغ = لا خرق)"
+        required: false
+        default: ""
+        type: string
+
+# إلغاء التشغيلات القديمة على الفرع نفسه: مراجعة نتيجة بائتة أسوأ من انتظار.
+#
+# لكن ليس على `main`. `main` هي مصدر دليل الإغلاق — «CI شُغِّل فعليًا وعاد أخضر
+# · رقم التشغيل» — وتشغيلةٌ مُلغاة ليست ناجحة ولا فاشلة، وهي لا تُرسل بريدًا
+# فتُقرأ خضراء بالسكوت. فشريحة تُغلق على التزامٍ أُلغيت تشغيلته تُسجَّل بدليل
+# لا وجود له.
+concurrency:
+  # المجموعة تُشتقّ من **رقم طلب الدمج** لا من المرجع، لأن `github.ref` في حدث
+  # `pull_request` هو `refs/pull/N/merge` — يصحّ عمليًّا، لكن التسميةَ برقم
+  # الطلب تجعل ما يُلغى ظاهرًا لقارئ السجلّ. و`main` تحتفظ بمجموعتها.
+  group: >-
+    ${{ github.workflow }}-${{
+      github.event_name == 'pull_request'
+      && format('pr-{0}', github.event.pull_request.number)
+      || github.ref
+    }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# -- التسلسل التلقائي للبوابات المفعّلة --------------------------------------
+# مصدر التسلسل يبقى `scripts/quality.sh` وحده — هذا العَلَم يختار **أيّ
+# استدعاء** يُنفَّذ، لا ماذا يحتوي، فلا تسلسل ثانيًا يُعرَّف هنا:
+#
+#   FULL_SUITE=true   → المهامّ المفعّلة التي يُعيدها `quality.sh --list-shards`،
+#                       كلٌّ بـ`quality.sh --shard=<name>`
+#   FULL_SUITE=false  → مهمةٌ واحدة `quick`: `bash scripts/quality.sh`
+#
+# البوابات الموقفة محليًّا بقرار تبقى موقفة في CI أيضًا: لا يمرّر هذا الملف
+# `--include-suspended` ولا يعيد تفعيلها. تبقى أوامرها المفردة للاستعمال اليدوي.
+#
+# الأحداث الثلاثة الباقية — دفعةٌ إلى `main`، وطلبُ دمجٍ إليها، و`workflow_dispatch`
+# — تجعل التعبيرَ أدناه `true` دائمًا. **وأُبقي التعبيرُ ولم يُستبدَل بـ`true`
+# حرفيّة** كي يبقى الشرطُ محكومًا بالمحفِّزات: لو أُعيد يومًا محفِّزٌ لفرع عمل،
+# عاد التمييزُ من نفسِه بدل أن يمرّ فرعٌ بتسلسلٍ كاملٍ صامتٍ يستنزف الحصة.
+env:
+  FULL_SUITE: ${{ github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
+
+# -- البنية ------------------------------------------------------------------
+#   plan      تسأل السكربتَ عن المهامّ، وتفحص وثائق التحليل المحمية (مرةً لا لكل مهمة)
+#   gates     مصفوفةٌ مشتقة — عنصرها التلقائي اليوم `core` وحده
+#   quality   «بوابات الجودة» — الجامعة. **وحدها الفحصُ المطلوب على `main`**
+#
+# النتيجة المقصودة: حزمة Docker واحدة والبوابات المفعّلة فقط، ويجب أن يعلن
+# السجل الموقفة صراحةً.
+jobs:
+  plan:
+    name: تخطيط المهامّ
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      shards: ${{ steps.list.outputs.shards }}
+    steps:
+      - name: سحب المستودع
+        uses: actions/checkout@v4
+        with:
+          # protected-paths-check يقارن بقاعدة طلب الدمج فيحتاج التاريخ
+          fetch-depth: 0
+
+      - name: حماية وثائق التحليل
+        # هنا كي تُشغَّل مرةً لا مرةً لكل مهمة، ولأن سقوطَها يُسقط `plan` فتُتخطّى
+        # المصفوفةُ كلُّها وتحمرّ الجامعة — لا يُنفَق إقلاعُ حزمةٍ على طلبٍ
+        # مرفوضٍ سلفًا.
+        if: github.event_name == 'pull_request'
+        env:
+          PROTECTED_BASE_REF: ${{ github.event.pull_request.base.sha }}
+        run: bash scripts/protected-paths-check.sh "$PROTECTED_BASE_REF"
+
+      - name: قائمة المهامّ من quality.sh
+        id: list
+        run: |
+          if [ "${FULL_SUITE}" = "true" ]; then
+            shards="$(bash scripts/quality.sh --list-shards)"
+          else
+            shards='["quick"]'
+          fi
+          echo "المهامّ: ${shards}"
+          # قائمةٌ فارغةٌ تُنتج مصفوفةً بلا مهامّ، ومهمةٌ جامعةٌ تجد
+          # «لا فشل» فتخضرّ على لا شيء. يُرفَض ذلك هنا صراحةً.
+          case "${shards}" in
+            '['*'"'*']') ;;
+            *) echo "::error::قائمة المهامّ فارغة أو تالفة: ${shards}"; exit 1 ;;
+          esac
+          echo "shards=${shards}" >> "$GITHUB_OUTPUT"
+
+  gates:
+    name: بوابة — ${{ matrix.shard }}
+    needs: plan
+    runs-on: ubuntu-latest
+    # أطول مهمةٍ منفردة قِيست نحو 10 دقائق بوابةً + ~3 إقلاعًا. المهلةُ تتّسع
+    # لضعف ذلك: مهلةٌ تقتل تشغيلةً مشروعة تُنفق الدقائق ولا تُعطي نتيجة.
+    timeout-minutes: 30
+    strategy:
+      # `false` لا `true`: سقوطُ مهمةٍ لا يُلغي أخواتها. تشغيلةٌ حمراءُ تُريك
+      # كلَّ ما سقط خيرٌ من تشغيلةٍ تُريك أولَ ما سقط ثم تُلغي البقية.
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - name: سحب المستودع
+        uses: actions/checkout@v4
+        with:
+          # كاشف الأسرار يحتاج التاريخ لفحص ما هو متعقَّب فعلًا
+          fetch-depth: 0
+
+      - name: تهيئة ملف البيئة
+        # الحزمة تتطلب متغيرات إلزامية (MYSQL_PASSWORD وغيرها). القالب يحمل
+        # قيمًا وهمية وهي الصحيحة هنا: لا سر حقيقي يدخل مُشغِّل CI.
+        #
+        # ثم تُضبط هوية المستخدم على هوية المُشغِّل. القالب يثبّت APP_UID=1000
+        # ومستخدم `runner` على GitHub هو **1001**. بدون الضبط يصير مستخدم
+        # الحاوية (1000) غير مالكٍ للنسخة المربوطة، ويسقط أول أمر يكتب في
+        # storage/logs أو bootstrap/cache:
+        #
+        #     storage/logs/laravel.log … Failed to open stream: Permission denied
+        #
+        # لم يظهر هذا على ويندوز لأن Docker Desktop يعرض كل ربط بـ0777 فتذوب
+        # دلالة الملكية أصلًا — نفس سبب خفاء بت التنفيذ على سكربت تهيئة MySQL.
+        run: |
+          cp .env.example .env
+          sed -i "s/^APP_UID=.*/APP_UID=$(id -u)/" .env
+          sed -i "s/^APP_GID=.*/APP_GID=$(id -g)/" .env
+          echo "هوية المُشغِّل: APP_UID=$(id -u) APP_GID=$(id -g)"
+
+      - name: إصدارات أدوات الحاويات
+        # تشخيصي لا بوابة. الفرق بين إصدار Compose على جهاز التطوير وإصداره على
+        # المُشغِّل كان جزءًا من سبب خفاء عطب: `--wait` يتعامل مع خدمة بلا فحص
+        # صحة تعاملًا مختلفًا بين الإصدارات. طباعته في كل تشغيل تجعل أي انحراف
+        # لاحق مرئيًا في السجل بدل أن يُكتشف بفشل غامض.
+        run: |
+          docker --version
+          docker compose version
+
+      # -- Build layer cache ------------------------------------------------
+      # Measured: the build was 4:12 of a 5:45 run - 73% of every run spent
+      # recompiling PHP extensions and reinstalling Alpine packages that had
+      # not changed. A runner starts with no cache, so the layers are built
+      # from scratch on every commit.
+      #
+      # buildx with a container driver is a precondition for `type=gha`; the
+      # runner's default driver cannot export a cache at all.
+      - name: تهيئة buildx (شرط ذاكرة الطبقات)
+        uses: docker/setup-buildx-action@v3
+
+      # `docker compose build` - unlike `docker/build-push-action` - does not
+      # hand BuildKit the GitHub cache service tokens by itself. Exporting them
+      # here is what makes `type=gha` in compose.ci.yaml able to work, and the
+      # action doing it is GitHub's own rather than a third party's.
+      #
+      # `ACTIONS_CACHE_URL` is dropped deliberately: it is the retired v1 cache
+      # endpoint, and exporting it sends BuildKit there, where it answers with
+      # an HTML page under status 400 and the build dies:
+      #
+      #   failed to parse error response 400: <h2>Our services aren't
+      #   available right now</h2> ... invalid character '<'
+      #
+      # Only `ACTIONS_RESULTS_URL` (the v2 service) is exported, with the token.
+      - name: تصدير رموز خدمة الذاكرة إلى البيئة
+        uses: actions/github-script@v7
+        with:
+          script: |
+            for (const k of ['ACTIONS_RUNTIME_TOKEN', 'ACTIONS_RESULTS_URL']) {
+              if (process.env[k]) core.exportVariable(k, process.env[k]);
+            }
+
+      - name: بناء الحزمة وتشغيلها
+        # compose.ci.yaml is a CACHE-ONLY layer - it changes no service and is
+        # never used locally. A cache failure degrades rather than breaks:
+        # every exporter carries ignore-error=true, so an unreachable cache
+        # service costs a cold build and nothing more.
+        run: |
+          docker compose --project-directory . \
+            -f docker/compose/compose.yaml \
+            -f docker/compose/compose.dev.yaml \
+            -f docker/compose/compose.ci.yaml \
+            up -d --wait
+
+      - name: تثبيت اعتماديات PHP
+        run: |
+          docker compose --project-directory . \
+            -f docker/compose/compose.yaml \
+            -f docker/compose/compose.dev.yaml \
+            exec -T php sh -lc "cd /var/www/html && composer install --no-interaction --prefer-dist --no-progress"
+
+      - name: تهيئة قاعدة البيانات
+        # Mirrored locally by `make db-reset`. A gate that reads the database
+        # while it generates (the OpenAPI contract gate) is RED on an unseeded
+        # database — documented in docker/README.md §1 so the local path and
+        # this one cannot drift again.
+        run: |
+          docker compose --project-directory . \
+            -f docker/compose/compose.yaml \
+            -f docker/compose/compose.dev.yaml \
+            exec -T php sh -lc "cd /var/www/html && php artisan migrate:fresh --seed --force"
+
+      # الخرقُ المتعمَّد. لا يعمل إلا في تشغيلةٍ يدوية طُلب فيها كسرُ هذه
+      # المهمة بعينها، ويسقط **قبل** البوابات كي لا يُنفق دقائقها.
+      - name: خرق متعمَّد (إثبات البوابة)
+        if: github.event_name == 'workflow_dispatch' && inputs.break_shard == matrix.shard
+        run: |
+          echo "::error::خرقٌ متعمَّد للمهمة «${{ matrix.shard }}» — يجب أن تحمرّ «بوابات الجودة»"
+          exit 1
+
+      # ── البوابات ────────────────────────────────────────────────────────
+      # الوضع والمهمة يُطبعان قبل التشغيل: قارئ السجل لاحقًا يحتاج أن يعرف
+      # **أيّ جزءٍ** من أيّ تسلسل أنتج هذه الخضرة. و«N/A تُعلَن ولا تُسكت».
+      - name: تشغيل بوابات الجودة (${{ matrix.shard }})
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          if [ "${SHARD}" = "quick" ]; then
+            echo "▶ التسلسل السريع — المراحل الرخيصة فقط"
+            echo "  ⚠ ليس دليلًا لإغلاق شريحة: بوابات المتصفّح وPHPUnit والتغطية لم تُشغَّل."
+            echo "    لإغلاق شريحة على هذا الفرع، أطلق التسلسل التلقائي يدويًا:"
+            echo "    gh workflow run CI --ref ${GITHUB_REF_NAME}"
+            bash scripts/quality.sh
+          else
+            echo "▶ التسلسل التلقائي — المهمة «${SHARD}»"
+            echo "  (البوابات المفعّلة فقط؛ الموقفة بقرار لا تشملها هذه الخضرة)"
+            bash scripts/quality.sh "--shard=${SHARD}"
+          fi
+
+      # Visual-gate evidence. When the visual comparison runs (manually, or
+      # the day it is re-enabled in the sequence) Playwright writes
+      # expected/actual/diff triplets under test-results/ and quality.sh keeps
+      # the full stage output under gate-logs/. Uploaded `always()` so a red
+      # run can be classified after the fact — a load timeout is UNMEASURED,
+      # a pixel difference is FAIL, and the distinction is only readable in
+      # the artefacts. `ignore` keeps a run without them green.
+      - name: رفع أدلة المطابقة البصرية والسجلات
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-evidence-${{ matrix.shard }}
+          path: |
+            frontend/test-results/**
+            frontend/gate-logs/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: سجلات الحزمة عند الفشل
+        if: failure()
+        run: |
+          docker compose --project-directory . \
+            -f docker/compose/compose.yaml \
+            -f docker/compose/compose.dev.yaml \
+            logs --tail=120
+
+      - name: هدم الحزمة
+        if: always()
+        run: |
+          docker compose --project-directory . \
+            -f docker/compose/compose.yaml \
+            -f docker/compose/compose.dev.yaml \
+            down -v
+
+  # ── الجامعة — الفحصُ المطلوب على `main` ───────────────────────────────────
+  # الاسمُ «بوابات الجودة» **حرفيًّا**: هو ما تشترطه حمايةُ `main` (سياقٌ واحد
+  # من GitHub Actions، `strict`). اسمٌ آخرُ يُوقف كلَّ دمجٍ قادم، ومهمةٌ أخرى
+  # بالاسم نفسِه تجعل الفحصَ المطلوبَ أوّلَ ما يُبلِّغ لا آخرَه.
+  #
+  # `if: always()` لأن الجامعةَ يجب أن تُبلِّغ **دائمًا** — ولو سقطت `plan`
+  # فتُخطِّيت المصفوفة. ومهمةٌ مُتخطّاةٌ في GitHub **تُحتسب ناجحةً** في الفحوص
+  # المطلوبة؛ فجامعةٌ بلا `always()` كانت ستُتخطّى حين يسقط ما قبلها، فيُقرأ
+  # السقوطُ خضرةً. ولذلك تشترط `success` حرفيًّا: `skipped` و`cancelled`
+  # و`failure` كلُّها حمراء.
+  quality:
+    name: بوابات الجودة
+    needs: [plan, gates]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: الحكم على المهامّ كلِّها
+        env:
+          PLAN_RESULT: ${{ needs.plan.result }}
+          GATES_RESULT: ${{ needs.gates.result }}
+          SHARDS: ${{ needs.plan.outputs.shards }}
+        run: |
+          echo "تخطيط المهامّ: ${PLAN_RESULT}"
+          echo "المهامّ: ${SHARDS}"
+          echo "نتيجة المصفوفة: ${GATES_RESULT}"
+          if [ "${PLAN_RESULT}" != "success" ] || [ "${GATES_RESULT}" != "success" ]; then
+            echo "::error::بوابات الجودة حمراء — مهمةٌ واحدةٌ على الأقل لم تنجح (راجع «بوابة — …» أعلاه)"
+            exit 1
+          fi
+          echo "✓ كل المهامّ خضراء"
