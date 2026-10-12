@@ -2,6 +2,10 @@
 
 All framework changes are recorded here. The framework obeys its own rules: a standard is never edited silently; every change carries a version and a reason.
 
+## 0.2.1 — 2026-10-12
+
+- `README.md §9` is now the **end-to-end execution guide**: a stage map (0–11) with exit gates, the steps of every stage from the foundational discovery to UAT, handover and project closure, the three loops that run inside every stage (decision closing, change request, report-and-stop), the roles per stage, and a measured timeline example from the reference project. Stage §9.2 absorbs the former "how a new project starts" list.
+
 ## 0.2.0 — 2026-10-12
 
 Updated from the reference project's experience between the first extraction (2026-10-01, CR-362) and 2026-10-12 (CR-428): the English-language programme, the SEO programme, the Phase 1B readiness review, the QA-report programme with its comprehensive re-check, the parallel-limit raise, the CI mirror, and the opening of a second project from the framework.
