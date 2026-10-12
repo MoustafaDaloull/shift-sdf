@@ -110,6 +110,13 @@ set_env() {
     if grep -q "^${key}=" "$file"; then
         sed -i "s|^${key}=.*|${key}=${val}|" "$file"
     else
+        # A file whose last line has no trailing newline would glue the new
+        # key onto it («LAST_KEY=truePORT_SLOT=1»), so the slot was invisible
+        # to the next `new` and every tree got slot 1 — the very collision the
+        # slots exist to prevent (lessons L-037). Terminate the file first.
+        if [ -s "$file" ] && [ -n "$(tail -c1 "$file")" ]; then
+            printf '\n' >> "$file"
+        fi
         printf '%s=%s\n' "$key" "$val" >> "$file"
     fi
 }
@@ -122,10 +129,13 @@ case "$ACTION" in
 
 new)
     # الحدّ الأقصى لشجرات العمل الإضافية من الإعداد. الشجرة الرئيسة للتكامل
-    # ولا تدخل في العد.
+    # ولا تدخل في العد. رفع الحدّ قرارُ مالك منتج مسنودٌ بقياس سعة الجهاز
+    # (المعالجات · ذاكرة Docker · حجم الحزمة الخاملة لكل شجرة) — لا رغبةٌ في
+    # مزيد من التوازي: عند تجاوز السعة تتباطأ البوابات بعضها ببعض وتسقط
+    # بمهلاتٍ لا عيبَ في الكود معها (lessons L-036).
     ACTIVE_EXTRA=$(( $(git worktree list --porcelain | grep -c '^worktree ' || echo 1) - 1 ))
     if [ "$ACTIVE_EXTRA" -ge "$MAX_EXTRA" ]; then
-        red "✗ بلغت شجرات العمل الحد الأقصى: $MAX_EXTRA شجرة إضافية (MAX_EXTRA_WORKTREES)"
+        red "✗ بلغت شجرات العمل الحد الأقصى: $MAX_EXTRA شجرة إضافية (MAX_EXTRA_WORKTREES في shift.env — يُرفع بقرار مسجَّل بعد قياس السعة)"
         exit 2
     fi
 

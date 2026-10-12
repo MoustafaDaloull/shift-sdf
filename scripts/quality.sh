@@ -20,6 +20,7 @@
 #   bash scripts/quality.sh --with-tests كل شيء بما فيه الاختبارات
 #   bash scripts/quality.sh fmt|stan|arch|secrets   فحص واحد
 #   bash scripts/quality.sh sync           المزامنة وشجرات العمل وحدها
+#   bash scripts/quality.sh i18n           ترجمة الواجهة وحدها (GATE-I18N — للمشروع ثنائي اللغة)
 #
 #   بوابة مُوقفة بقرار (SUSPENDED_GATES في shift.env) تُعلَن في كل تشغيلة ولا
 #   تحجب. لإعادة المُوقفات كلِّها في تشغيلةٍ واحدة:
@@ -85,7 +86,7 @@ STAGE=""
 INCLUDE_SUSPENDED="${QG_INCLUDE_SUSPENDED:-0}"
 SUSPENDED_COUNT=0
 
-KNOWN_STAGES="sync fmt stan arch scenario routes fe-static fe-unit fe-e2e fe-visual fe-a11y secrets audit openapi integration tests coverage"
+KNOWN_STAGES="sync fmt stan arch scenario routes fe-static i18n fe-unit fe-e2e fe-visual fe-a11y secrets audit openapi integration tests coverage"
 
 _in_list() {
     local x
@@ -438,6 +439,69 @@ stage_fe_static() {
     rc="${PIPESTATUS[0]}"
     $NODE_EXEC "cd $NODE_WORKDIR && npx eslint . --max-warnings=0" 2>&1 | tail -12 || rc=1
     return "$rc"
+}
+
+# ── GATE-I18N — the client app's translations (bilingual projects) ───────────
+# Three checks in one Node script (scripts/i18n/i18n-check.cjs), inside the
+# node container like GATE-FE-01 because the TypeScript compiler lives there:
+#   (a) key parity — <locales>/<primary>/*.json and <locales>/<secondary>/*.json
+#       hold the same keys, every message parses as ICU, each key uses the
+#       same {placeholders} in both languages, and no primary-language message
+#       formats a number or a date through ICU;
+#   (b) literal ratchet — no client-reachable file may hold MORE primary-
+#       language string literals / JSX text than scripts/i18n/literals.baseline.json
+#       allows, and a file absent from it may hold none. Slices that move texts
+#       into the catalogue lower the counts (bash scripts/i18n/refresh-baseline.sh);
+#   (c) one sentence = one key — a sentence may not be assembled from several
+#       t() calls around a link, an emphasis or a value (no baseline: zero).
+#
+# The script, its config and its baseline travel on stdin — prepended as two
+# assignments — because only the frontend is mounted in the container. Nothing
+# is copied into it, and the gate reads exactly the files in the working tree.
+#
+# Applicability (I18N_GATE in shift.env): `auto` runs the gate when the locales
+# directory exists and declares it N/A — out loud, never silently — when it
+# does not; `on` makes a missing directory red; `off` keeps it out of the
+# sequence (still runnable by name). A missing baseline is red, never a pass.
+stage_i18n() {
+    local locales="$FRONTEND_SRC/$I18N_LOCALES_SUBDIR"
+    if [ "$I18N_GATE" = "off" ]; then
+        yellow "  N/A — GATE-I18N خارج التسلسل بالإعداد (I18N_GATE=off)"
+        return 0
+    fi
+    if [ ! -d "$locales" ]; then
+        if [ "$I18N_GATE" = "on" ]; then
+            red "  مجلد الترجمة غائب: $locales — والبوابة مطلوبة (I18N_GATE=on)"
+            return 1
+        fi
+        yellow "  N/A — لا مجلد ترجمة ($locales): مشروع بلغة واحدة. للفرض: I18N_GATE=on"
+        return 0
+    fi
+    require_node_container || return 0
+    local baseline="$I18N_BASELINE_FILE"
+    if [ ! -f "$baseline" ]; then
+        red "  الأساس غائب: $baseline — أنشئه: bash scripts/i18n/refresh-baseline.sh"
+        return 1
+    fi
+    mkdir -p "$GATE_LOGS"
+    local rc=0
+    {
+        printf 'globalThis.SHIFT_I18N = %s;\n' "$(_i18n_config_json)"
+        printf 'globalThis.SHIFT_I18N_BASELINE = '; cat "$baseline"; printf ';\n'
+        cat scripts/i18n/i18n-check.cjs
+    } | $NODE_EXEC "cd $NODE_WORKDIR && node -" > "$GATE_LOGS/i18n.log" 2>&1 || rc=$?
+    tail -n 24 "$GATE_LOGS/i18n.log"
+    [ "$rc" -ne 0 ] && yellow "  المخرَج الكامل: $GATE_LOGS/i18n.log"
+    return "$rc"
+}
+
+# The gate's configuration as one JSON object (values from shift.env). Paths
+# are relative to the frontend root as mounted in the container.
+_i18n_config_json() {
+    local src="${FRONTEND_SRC#"$FRONTEND_DIR"/}"
+    printf '{"src":"%s","locales":"%s","primary":"%s","secondary":"%s","entries":"%s","excludeRegex":"%s","translateFn":"%s"}' \
+        "$src" "$src/$I18N_LOCALES_SUBDIR" "$I18N_PRIMARY_LOCALE" "$I18N_SECONDARY_LOCALE" \
+        "$I18N_CLIENT_ENTRIES" "$(printf '%s' "$I18N_EXCLUDE_REGEX" | sed 's/\\/\\\\/g; s/"/\\"/g')" "$I18N_TRANSLATE_FN"
 }
 
 # ── GATE-FE-02 — component tests ─────────────────────────────────────────────
@@ -818,6 +882,7 @@ case "${1:-all}" in
     scenario) run_stage "تغطية السيناريوهات (AS-035)" stage_scenario ;;
     routes)  run_stage "مسارات الواجهة (GATE-FE-05/06)" stage_routes ;;
     fe-static) run_stage "الفحص الساكن للواجهة (GATE-FE-01)" stage_fe_static ;;
+    i18n)      run_stage "ترجمة الواجهة (GATE-I18N)" stage_i18n ;;
     fe-unit)   run_stage "اختبار المكوّنات (GATE-FE-02)" stage_fe_unit ;;
     fe-e2e)    run_stage "تدفقات الواجهة (GATE-FE-03)" stage_fe_e2e ;;
     fe-visual) run_stage_visual "المطابقة البصرية (GATE-FE-04)" stage_fe_visual ;;
@@ -841,6 +906,7 @@ case "${1:-all}" in
         gate scenario  "تغطية السيناريوهات (AS-035)"           stage_scenario
         gate routes    "مسارات الواجهة (GATE-FE-05/06)"        stage_routes
         gate fe-static "الفحص الساكن للواجهة (GATE-FE-01)"     stage_fe_static
+        gate i18n      "ترجمة الواجهة (GATE-I18N)"             stage_i18n
         gate fe-unit   "اختبار المكوّنات (GATE-FE-02)"         stage_fe_unit
         gate secrets   "كاشف الأسرار"                          stage_secrets
         gate audit     "تدقيق الاعتماديات (AS-036)"            stage_audit

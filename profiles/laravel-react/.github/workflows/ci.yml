@@ -173,6 +173,34 @@ jobs:
           sed -i "s/^APP_GID=.*/APP_GID=$(id -g)/" .env
           echo "هوية المُشغِّل: APP_UID=$(id -u) APP_GID=$(id -g)"
 
+      # -- Docker Hub mirror (AS-062) ----------------------------------------
+      # A run failed twice before any gate started: Docker Hub refused the
+      # runner's unauthenticated pulls of redis/mysql («toomanyrequests»). The
+      # failure was infrastructure, not code - the same commit was green
+      # locally - so the fix is here, not in the code (lessons L-023 · L-039).
+      # Pull Docker Hub images through Google's public mirror instead: no
+      # account, no secret. The key is merged into an existing daemon.json,
+      # never overwriting it, and the daemon is restarted before any pull.
+      - name: مرآة Docker Hub العامة (mirror.gcr.io)
+        run: |
+          sudo mkdir -p /etc/docker
+          sudo python3 - <<'PY'
+          import json, os
+          path = '/etc/docker/daemon.json'
+          cfg = {}
+          if os.path.exists(path) and os.path.getsize(path) > 0:
+              with open(path) as f:
+                  cfg = json.load(f)
+          mirrors = cfg.get('registry-mirrors', [])
+          if 'https://mirror.gcr.io' not in mirrors:
+              mirrors.append('https://mirror.gcr.io')
+          cfg['registry-mirrors'] = mirrors
+          with open(path, 'w') as f:
+              json.dump(cfg, f, indent=2)
+          PY
+          sudo systemctl restart docker
+          docker info --format '{{json .RegistryConfig.Mirrors}}'
+
       - name: إصدارات أدوات الحاويات
         # تشخيصي لا بوابة. الفرق بين إصدار Compose على جهاز التطوير وإصداره على
         # المُشغِّل كان جزءًا من سبب خفاء عطب: `--wait` يتعامل مع خدمة بلا فحص
@@ -192,6 +220,12 @@ jobs:
       # runner's default driver cannot export a cache at all.
       - name: تهيئة buildx (شرط ذاكرة الطبقات)
         uses: docker/setup-buildx-action@v3
+        with:
+          # AS-062 - BuildKit's container driver pulls the Dockerfiles' base
+          # images itself, not through the daemon, so it needs the same mirror.
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
 
       # `docker compose build` - unlike `docker/build-push-action` - does not
       # hand BuildKit the GitHub cache service tokens by itself. Exporting them

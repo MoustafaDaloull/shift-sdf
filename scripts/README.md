@@ -19,6 +19,10 @@ scripts/
 ├── hooks/
 │   ├── pre-commit                    الأسرار · strict_types · Pint على المُدرَج
 │   └── post-commit                   تذكير «الالتزام والدفع حركة واحدة»
+├── i18n/
+│   ├── i18n-check.cjs                GATE-I18N: تطابق المفاتيح · سقف النص الحرفي · جملة واحدة = مفتاح واحد
+│   ├── refresh-baseline.sh           إعادة كتابة سقف النص الحرفي من الكود الحالي (يتقلّص لا يتوسع)
+│   └── literals.baseline.json        خطّ الأساس — `{}` في الإطار، ويُملأ في المشروع
 ├── quality.sh                        مصدر الحقيقة الوحيد لتسلسل البوابات
 ├── sync-check.sh                     QG-SYNC: شجرات العمل · لا التزام غير مدفوع · قفل التشغيلة
 ├── arch-check.sh                     الحدود المعمارية وقواعد الملفات (AS-031)
@@ -47,6 +51,7 @@ scripts/
 | `arch-check.sh` | ملكية الجداول بالبادئة · لا FK عابر · لا JOIN عابر · لا استيراد مباشر من موديول آخر (الطريق الوحيد `Shared/Contracts`) · مجلد موديول غير مسجَّل في `modules.tsv` = خرق · هجرات داخل موديولها · مسارات مُصدَّرة في الكود والوثائق · `strict_types` · لا `env()` خارج `config/` · لا `float` في سياق مالي · انحراف إصدار الوثائق · سلامة المتتبع · لا علامة نائبة في HEAD | `bash scripts/arch-check.sh` |
 | `scenario-check.sh` | كل `@scenario TS-<CODE>-NNN` في الاختبارات معرَّف فعلًا في `test-scenarios.md` لموديوله، وكل `@covers` معرَّف في مصدره. عتبة `P1` تُعلَن غير مفروضة ولا تُحتسب نجاحًا | `bash scripts/scenario-check.sh` |
 | `route-check.sh` | كل مسار في `routes.tsx` له صفّ `APPROVED` في سجل الإدارة أو العملاء، مطلقًا ومنسوخًا حرفيًا، وفي مجلد موديوله المالك. وفحوص فساد ذاتية على السجلين قبل قراءة سطر كود. وملفُّ مسارات باسم غير المُعدّ يُرصد لا يُهمَل | `bash scripts/route-check.sh` |
+| `i18n/i18n-check.cjs` | **للمشروع ثنائي اللغة** (`GATE-I18N`): (أ) كل مفتاح في كتالوج اللغة الأساسية له نظير في الثانية وبالمتغيّرات نفسها، وكل رسالة ICU صالحة، ولا رسالة أساسية تنسّق رقمًا أو تاريخًا عبر ICU · (ب) سقف النصوص الحرفية بلغة الواجهة الأساسية لكل ملف يصل إليه العميل — يتقلّص ولا يرتفع · (ج) لا جملة مقسّمة على أكثر من استدعاء ترجمة. يعمل داخل حاوية node والإعداد والأساس يُمرَّران إليه على stdin. `I18N_GATE=auto` يعلنه `N/A` بصوت حين لا مجلد ترجمة | تستدعيه مرحلة `i18n` · الأساس بـ`bash scripts/i18n/refresh-baseline.sh` |
 | `secret-scan.sh` | تسعة أنماط (PEM · AWS · Google · حساب خدمة · مفاتيح دفع · Slack · GitHub · JWT · كلمة مرور حقيقية) على المُدرَج أو الكل أو **التاريخ كله**. لا يُتجاوَز بحال | `bash scripts/secret-scan.sh [--all\|--history]` |
 | `protected-paths-check.sh` | ملف يطابق `config/protected-paths.txt` تغيّر في مدى PR بلا معرّف CR في رسائل الالتزام ⟵ فشل | `bash scripts/protected-paths-check.sh [base-ref]` |
 | `coverage-check.php` | يقرأ Clover ويقيس **بالنطاق**: الخدمات · الموديولات المالية · العام. نطاق بلا ملفات `N/A` لا نجاح. العتبات من `shift.env` عبر البيئة | تستدعيه مرحلة `coverage` داخل الحاوية |
@@ -62,7 +67,7 @@ scripts/
 
 ## 3. تسلسل البوابات
 
-الترتيب مقصود (`AS-030`): **الأرخص أولًا**. لا معنى لتشغيل مجموعة اختبارات على كود يخالف التنسيق. المراحل من 1 إلى 11 تعمل بـ`bash scripts/quality.sh`، ومن 12 إلى 17 تُضاف بـ`--with-tests`.
+الترتيب مقصود (`AS-030`): **الأرخص أولًا**. لا معنى لتشغيل مجموعة اختبارات على كود يخالف التنسيق. المراحل من 1 إلى 12 تعمل بـ`bash scripts/quality.sh`، ومن 13 إلى 18 تُضاف بـ`--with-tests`.
 
 | # | المرحلة | معرّف البوابة | الأداة | ما تفحصه |
 |---|---|---|---|---|
@@ -70,23 +75,24 @@ scripts/
 | 2 | `fmt` | — | Pint | التنسيق |
 | 3 | `stan` | — | PHPStan + Larastan | التحليل الساكن بالمستوى الذي يُعلنه `phpstan.neon` |
 | 4 | `arch` | `AS-031` | Deptrac + `arch-check.sh` | رسم الاعتماديات بين الأصناف + قواعد الملفات والمحتوى |
-| 5 | `scenario` | `AS-035` | `scenario-check.sh` | كل وسم سيناريو له تعريف في حزمة موديوله |
+| 5 | `scenario` | `AS-035` | `scenario-check.sh` | كل وسم سيناريو له تعريف في حزمة موديوله (والمعرّف بين علامتَي كود مقروء) |
 | 6 | `routes` | `GATE-FE-05` · `GATE-FE-06` | `route-check.sh` | مسارات الواجهة مسنودة بسجل معتمد |
 | 7 | `fe-static` | `GATE-FE-01` | ESLint + `tsc --noEmit` | صفر خطأ · `--max-warnings=0` |
-| 8 | `fe-unit` | `GATE-FE-02` | Vitest + RTL | اختبارات المكوّنات |
-| 9 | `secrets` | `AS-020` | `secret-scan.sh --all` | لا سرّ في الملفات المتعقَّبة |
-| 10 | `audit` | `AS-036` | `composer audit --locked` + `npm audit --package-lock-only` | لا ثغرة High/Critical في القفلين |
-| 11 | `openapi` | `API-030` · `DoD-SL-09` | Scramble + `diff` | العقد الملتزَم يطابق المُولَّد من الكود، ولا تحذير |
-| 12 | `fe-e2e` | `GATE-FE-03` | Playwright (مشروع `e2e`) | تدفقات الواجهة |
-| 13 | `fe-visual` | `GATE-FE-04` | Playwright (مشروع `visual`) | المطابقة البصرية — `PASS` لا يُطبع بلا حزمة صور محفوظة |
-| 14 | `fe-a11y` | `QG-A11Y` | axe-core عبر Playwright (مشروع `a11y`) | الإتاحة |
-| 15 | `integration` | `QG-INTEG` | Playwright (مشروع `integration`) | الواجهة والخلفية الحقيقية معًا |
-| 16 | `tests` | — | PHPUnit **في الحزمة المعزولة** | الاختبارات، والتحذير فشل (`AS-002`) |
-| 17 | `coverage` | `AS-034` | `coverage-check.php` | عتبات التغطية بالنطاق من ناتج المرحلة 16 |
+| 8 | `i18n` | `GATE-I18N` · `AS-037` | `i18n/i18n-check.cjs` | ثنائي اللغة: تطابق المفاتيح · سقف النص الحرفي · جملة واحدة = مفتاح واحد. `N/A` مُعلَنة في مشروع بلغة واحدة |
+| 9 | `fe-unit` | `GATE-FE-02` | Vitest + RTL | اختبارات المكوّنات |
+| 10 | `secrets` | `AS-020` | `secret-scan.sh --all` | لا سرّ في الملفات المتعقَّبة |
+| 11 | `audit` | `AS-036` | `composer audit --locked` + `npm audit --package-lock-only` | لا ثغرة High/Critical في القفلين |
+| 12 | `openapi` | `API-030` · `DoD-SL-09` | Scramble + `diff` | العقد الملتزَم يطابق المُولَّد من الكود، ولا تحذير |
+| 13 | `fe-e2e` | `GATE-FE-03` | Playwright (مشروع `e2e`) | تدفقات الواجهة |
+| 14 | `fe-visual` | `GATE-FE-04` | Playwright (مشروع `visual`) | المطابقة البصرية — `PASS` لا يُطبع بلا حزمة صور محفوظة |
+| 15 | `fe-a11y` | `QG-A11Y` | axe-core عبر Playwright (مشروع `a11y`) | الإتاحة |
+| 16 | `integration` | `QG-INTEG` | Playwright (مشروع `integration`) | الواجهة والخلفية الحقيقية معًا |
+| 17 | `tests` | — | PHPUnit **في الحزمة المعزولة** | الاختبارات، والتحذير فشل (`AS-002`) |
+| 18 | `coverage` | `AS-034` | `coverage-check.php` | عتبات التغطية بالنطاق من ناتج المرحلة 17 |
 
 كل مرحلة تعمل وحدها باسمها: `bash scripts/quality.sh fe-unit`. والسطر الأخير «كل البوابات المُفعَّلة خضراء» **مقيَّد بما شُغِّل**: تحته يُطبع عدد المُوقفات إن وُجدت، فلا تُقرأ الخضرة فحصًا كاملًا.
 
-**متطلبات تأخذها السكربتات مُسلَّمةً** (من ملف تعريف Laravel + React): خدمتا `php` و`node` في Compose، وحزمة اختبار معزولة (`compose.test.yaml`) بخدمتَي `test-deps` و`test`، وسكربتا `typecheck` و`test` في `package.json`، ومشاريع Playwright بالأسماء `e2e` · `visual` · `a11y` · `integration`، ومجلد `frontend/gate-logs/` في `.gitignore`.
+**متطلبات تأخذها السكربتات مُسلَّمةً** (من ملف تعريف Laravel + React): خدمتا `php` و`node` في Compose، وحزمة اختبار معزولة (`compose.test.yaml`) بخدمتَي `test-deps` و`test`، وسكربتا `typecheck` و`test` في `package.json`، ومشاريع Playwright بالأسماء `e2e` · `visual` · `a11y` · `integration`، ومجلد `frontend/gate-logs/` في `.gitignore`. وللمشروع ثنائي اللغة: `typescript` و`@formatjs/icu-messageformat-parser` في اعتماديات التطوير، وكتالوج `src/i18n/locales/<locale>/*.json`.
 
 ---
 
@@ -145,7 +151,7 @@ bash scripts/quality.sh --with-tests | tee run.log  # ⛔ خطأ
 
 6. **اربط `Makefile` وCI بالسكربت لا بتسلسل خاص بهما:** `make quality` ⟵ `bash scripts/quality.sh`، وCI يستدعي `bash scripts/quality.sh --list-shards` ثم `--shard=<name>`، ويشغّل `protected-paths-check.sh` بقاعدة PR. لا يُكتب فحص في CI خارج `quality.sh`.
 7. **أضف إلى `.gitignore`:** `frontend/gate-logs/` (مخرجات البوابات والصور) — و`.env` بالطبع.
-8. **أثبِت كل بوابة بخرق متعمَّد قبل الاعتماد عليها، وسجّله:** سرّ وهمي يُسقط `secrets`، جدول ببادئة موديول آخر يُسقط `arch`، وسم `@scenario` لمعرّف غير موجود يُسقط `scenario`، مسار غير مسجَّل يُسقط `routes`، تغيير لون بمقدار درجة واحدة يُسقط `fe-visual`، شجرة رابعة أو متداخلة تُسقط `sync`، التزام فارغ غير مدفوع يُسقط `sync`. بوابة لم تحمرّ مرة واحدة بوابة غير مُثبَتة — سجّل الإثبات في سجل الأدلة مع البصمة التي أُجري عليها.
+8. **أثبِت كل بوابة بخرق متعمَّد قبل الاعتماد عليها، وسجّله:** سرّ وهمي يُسقط `secrets`، جدول ببادئة موديول آخر يُسقط `arch`، وسم `@scenario` لمعرّف غير موجود يُسقط `scenario`، مسار غير مسجَّل يُسقط `routes`، تغيير لون بمقدار درجة واحدة يُسقط `fe-visual`، شجرة زائدة عن الحد أو متداخلة تُسقط `sync`، التزام فارغ غير مدفوع يُسقط `sync`، ومفتاح في لغة بلا نظير أو جملة مقسّمة على استدعاءين يُسقط `i18n` (المشروع المرجعي أثبتها بسبعة خروق). بوابة لم تحمرّ مرة واحدة بوابة غير مُثبَتة — سجّل الإثبات في سجل الأدلة مع البصمة التي أُجري عليها.
 9. **أول تشغيلة كاملة:** `bash scripts/quality.sh --with-tests` على مستودع نظيف. ما يحمرّ من تهيئة (هجرات معلّقة · قاعدة غير مبذورة · حاوية متوقفة) تطبع البوابة علاجه في سطرها.
 
 ---
