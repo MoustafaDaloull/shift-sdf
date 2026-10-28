@@ -2,6 +2,18 @@
 
 All framework changes are recorded here. The framework obeys its own rules: a standard is never edited silently; every change carries a version and a reason.
 
+## 0.2.2 — 2026-10-28
+
+Agent context economy, measured on a second project running this framework.
+
+**Governance**
+- `governance/execution-instructions.md` 0.2.1 — **new §8.6**. (a) An agent is assigned a **track**, not a task: a subagent is an independent conversation that loads its whole context at startup and shares nothing with its siblings, so the unit of assignment is a full module slice it lives with until closure, the size cap belongs to the **pull request** and not to the agent, shared files / integration / decisions / `HG-I-*` gates and anything finishing in under ~10 turns stay with the integration owner in the parent session, and a broad **read** agent is the exception — judged by the context it keeps out. The worktree limit N is unchanged. Measured: 174 subagents over seven days, median 0.84 MB, 55% under 1 MB, against parent sessions averaging 48.6 MB — more than half of the week's agents did less work than their own startup cost. (b) **Context handover before clearing**: a summary printed in the conversation is erased with it, so the order is three steps — request it, write it somewhere durable, then clear and point the next session at the file. Defines what it carries (the §17 closing-report lines plus pending approvals, branch heads and open PR numbers), where each kind belongs, when clearing pays off and when it does not, and that the agent prepares the file and names its path but never clears on its own.
+- `governance/PROJECT-CONSTITUTION.md` 1.1 — §10(8) assignment by track, not by task; §13(7) context is not cleared before it is written; two new rows in the measured-lessons table.
+
+**Lessons** — `L-053` (agent assigned to a track, not a task) and `L-054` (a handover summary printed in the conversation is erased with it).
+
+**Checklists** — `slice-closure.md` 0.2.1 gains the handover-file item for a session about to be closed or cleared.
+
 ## 0.2.1 — 2026-10-12
 
 - `README.md §9` is now the **end-to-end execution guide**: a stage map (0–11) with exit gates, the steps of every stage from the foundational discovery to UAT, handover and project closure, the three loops that run inside every stage (decision closing, change request, report-and-stop), the roles per stage, and a measured timeline example from the reference project. Stage §9.2 absorbs the former "how a new project starts" list.
