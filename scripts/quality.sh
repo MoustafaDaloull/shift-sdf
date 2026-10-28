@@ -108,9 +108,68 @@ for _g in $SUSPENDED_GATES $MANUAL_ONLY_GATES; do
     fi
 done
 
+# ── إسناد البوابة إلى مهمة CI (0.2.3 · L-056) ────────────────────────────────
+# بوابةٌ غيرُ مذكورةٍ هنا تعمل في `core` — والافتراضيُّ أن `GATE_SHARDS` فارغة،
+# فالسلوكُ عندئذٍ هو سلوكُ ما قبل هذه النسخة **حرفًا بحرف**: مهمةٌ واحدة.
+#
+# **والقسمةُ تُقرَّر بالقياس لا بالصنف.** مهمتان متقاربتان في الزمن تُنصّفان
+# المسار؛ وعشرُ مهامٍّ إحداها تلتهم 60٪ لا تُقصّره شيئًا — زمنُ المصفوفة هو
+# زمنُ أطولِ مهمةٍ فيها، لا متوسطُها. فالقاعدة: **افرِد المقيسَ الأكبر وحدَه.**
+#
+# الصيغة في `shift.env`:  GATE_SHARDS="heavy:fe-e2e,fe-visual  slow:coverage"
+# — كلماتٌ مفصولةٌ بمسافات، كلٌّ `<اسم المهمة>:<معرّفات بوابات بفواصل>`.
+#
+# وإعدادٌ لا يُفهم لا يمرّ صامتًا، كما في قائمة الإيقاف أعلاه: معرّفٌ مكتوبٌ
+# خطأً كان سيترك البوابةَ في `core` **ويُقرأ إسنادًا**، فتظنّ أنك قسمتَ ولم تقسم.
+for _e in ${GATE_SHARDS:-}; do
+    case "$_e" in
+        *:*) ;;
+        *) printf '\033[31m%s\033[0m\n' "shift.env: GATE_SHARDS: «$_e» بلا «:» — الصيغة <job>:<gate,gate>"; exit 2 ;;
+    esac
+    _sname="${_e%%:*}"
+    if [ -z "$_sname" ]; then
+        printf '\033[31m%s\033[0m\n' "shift.env: GATE_SHARDS: «$_e» بلا اسم مهمة"; exit 2
+    fi
+    _old_ifs="$IFS"; IFS=','
+    for _gi in ${_e#*:}; do
+        IFS="$_old_ifs"
+        if ! _in_list "$_gi" "$KNOWN_STAGES"; then
+            printf '\033[31m%s\033[0m\n' "shift.env: GATE_SHARDS: «$_gi» ليست مرحلة معروفة — المراحل: $KNOWN_STAGES"
+            exit 2
+        fi
+        if [ "$_gi" = "sync" ]; then
+            printf '\033[31m%s\033[0m\n' "shift.env: GATE_SHARDS: QG-SYNC لا تُسنَد — تعمل في كل مهمة (قفل التشغيلة)"
+            exit 2
+        fi
+        IFS=','
+    done
+    IFS="$_old_ifs"
+done
+
+# معرّفُ البوابة الجاري توجيهها — يضعه `gate` ويقرؤه `_shard_of`. الأوامر
+# المفردة (`quality.sh fmt`) لا تمرّ بـ`gate`، فتبقى فارغةً وتُحسب على `core`،
+# وهو الصحيح: لا مصفوفةَ في تشغيلةٍ مفردة أصلًا.
+QG_GATE_ID=""
+
+_shard_of() { # -> اسم المهمة التي تحمل البوابة الجارية
+    local entry name ids gi old_ifs
+    [ -n "$QG_GATE_ID" ] || { printf 'core'; return 0; }
+    for entry in ${GATE_SHARDS:-}; do
+        name="${entry%%:*}"
+        old_ifs="$IFS"; IFS=','
+        for gi in ${entry#*:}; do
+            IFS="$old_ifs"
+            if [ "$gi" = "$QG_GATE_ID" ]; then printf '%s' "$name"; return 0; fi
+            IFS=','
+        done
+        IFS="$old_ifs"
+    done
+    printf 'core'
+}
+
 # ── CI shards ─────────────────────────────────────────────────────────────────
 # `--list-shards` changes no state and runs no gate. It walks the automatic
-# sequence and records `core` for every active gate. Suspended gates are
+# sequence and records each active gate's job (`core` unless GATE_SHARDS moves it). Suspended gates are
 # omitted unless a human explicitly passes `--include-suspended` locally, so
 # CI can never reactivate a suspended gate by implication. `--shard=<name>`
 # executes only that job's stages. QG_JOIN keeps a stage in the job of the
@@ -256,17 +315,18 @@ run_or_suspended() {
 # this one stage, count one, and pass the empty-shard guard it exists to trip.
 run_stage() {
     local label="$1"; shift
+    local _sh; _sh="$(_shard_of)"
     if [ "$QG_MODE" = "list" ]; then
-        _shard_record core
+        _shard_record "$_sh"
         return 0
     fi
-    if ! _in_shard core; then
+    if ! _in_shard "$_sh"; then
         if [ "$1" = "stage_sync" ]; then
             _exec_stage "$label" "$@"
             EXECUTED_COUNT=$((EXECUTED_COUNT - 1))
             return 0
         fi
-        declare_parallel "$label" core
+        declare_parallel "$label" "$_sh"
         return 0
     fi
     _exec_stage "$label" "$@"
@@ -309,12 +369,13 @@ declare_parallel() {
 # تأكيد، أو تعذّر حفظ الحزمة — ويُعدّ في FAILED كأي بوابة.
 run_stage_visual() {
     local label="$1"; shift
+    local _sh; _sh="$(_shard_of)"
     if [ "$QG_MODE" = "list" ]; then
-        _shard_record core
+        _shard_record "$_sh"
         return 0
     fi
-    if ! _in_shard core; then
-        declare_parallel "$label" core
+    if ! _in_shard "$_sh"; then
+        declare_parallel "$label" "$_sh"
         return 0
     fi
     _exec_stage_visual "$label" "$@"
@@ -349,6 +410,9 @@ _exec_stage_visual() {
 # من كتب اسم البوابة أرادها، مُوقفةً كانت أو لا.
 gate() {
     local id="$1" label="$2" fn="$3"
+    # 0.2.3: يُنشر المعرّفُ هنا ليقرأه `_shard_of`. الأوامرُ المفردة لا تمرّ
+    # بهذه الدالة، فتبقى `QG_GATE_ID` فارغةً وتُحسب على `core`.
+    QG_GATE_ID="$id"
     if _in_list "$id" "$MANUAL_ONLY_GATES"; then
         [ "$QG_MODE" = "list" ] && return 0
         declare_disabled "$label" "$SUSPENSION_DECISION" "يدويًّا فقط: bash scripts/quality.sh $id — لا تعود بـ--include-suspended"

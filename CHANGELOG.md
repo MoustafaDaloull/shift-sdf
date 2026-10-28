@@ -2,6 +2,25 @@
 
 All framework changes are recorded here. The framework obeys its own rules: a standard is never edited silently; every change carries a version and a reason.
 
+## 0.2.3 — 2026-10-28
+
+CI efficiency, measured on the second project running this framework. Every change here is about **how often a thing is checked and how the work is spread** — not about what is checked. No gate is dropped, no required check is filtered out, and the deliberate-break rule (§9.3) is untouched.
+
+**Governance**
+- `governance/execution-instructions.md` 0.2.2 — **new §9.4**, four binding standards. (1) **One trigger per change**: `on:` stays on `pull_request` and the push to the main branch; branch-pattern pushes are never added beside `pull_request`, because `github.ref` differs between the two events (`refs/heads/<branch>` vs `refs/pull/N/merge`) so their concurrency groups never cancel each other and the run happens twice. Measured over 200 runs on the second project: 84 of 116 (workflow x commit) pairs ran twice, 1,221 of 3,059 runner-minutes (40%) duplicated. (2) **Shard by measurement, not by category**: a matrix costs the time of its *longest* job, so the measured biggest gate is given a job of its own, assigned in `GATE_SHARDS` and derived by the workflow — never a second list in YAML. The joining job still requires every job, and `skipped`/`cancelled` are as red as `failure`. (3) **Timeout at least twice the measured time, re-measured at each slice closure**: the second project sat at 30 minutes while its gate had grown to 26:10. (4) **Thinning the sequence for a purely descriptive change needs both conditions**: the classification lives in the gate script's registry with a row lacking one exiting 2 in every mode and an unknown path always counting as code, **and** the claim "no heavy gate reads a descriptive file" is proven by searching the code. That claim was false on the second project: the approved permission matrix is read by a parity test inside the test gate, so editing the matrix alone would have skipped the only guard on it.
+- `governance/PROJECT-CONSTITUTION.md` 1.2 — §6 gains principles 9 and 10 (efficiency is never bought with a check; thinning has two conditions); four new rows in the measured-lessons table.
+
+**Scripts**
+- `scripts/quality.sh` — a gate's CI job is now declared in configuration and resolved by the script (`_shard_of`), instead of every gate being hardcoded to `core`. The matrix machinery existed since 0.2.0 and was unused. `GATE_SHARDS` empty — the default — is byte-identical to the previous behaviour: `--list-shards` still prints `["core"]`. An unknown gate id, a missing colon, or an attempt to assign `sync` exits 2, so a typo can never read as a split that did not happen.
+- `scripts/config/shift.env` — `GATE_SHARDS`, empty by default, with the measurement rule for choosing a split.
+
+**Profile**
+- `profiles/laravel-react/.github/workflows/ci.yml` — `persist-credentials: false` on **both** checkouts (it had none); the `[main]`-only trigger and the 30-minute timeout keep their rationale and gain the measurements that now back them; the matrix comment records that it branches through `GATE_SHARDS` without touching the workflow.
+
+**Lessons** — new section **ط**: `L-055` (two triggers on one change), `L-056` (a matrix costs its longest job), `L-057` (a timeout computed on a stale measurement), `L-058` (the token stays in `.git/config` unless told otherwise), `L-059` ("no check reads a descriptive file" is verified, not assumed).
+
+**Open debt** — the profile's workflow still pins actions by tag (`@v4`, `@v3`, `@v7`), not by commit SHA. A tag is mutable: whoever controls it controls what runs in CI. The second project pins every action by SHA. Raised here, not changed, because it needs a deliberate resolve-and-verify pass over each action.
+
 ## 0.2.2 — 2026-10-28
 
 Agent context economy, measured on a second project running this framework.
